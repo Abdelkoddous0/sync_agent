@@ -1,0 +1,7 @@
+rich
+watchdog
+pystray
+pillow
+plyer
+boto3
+pyinstaller
