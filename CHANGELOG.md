@@ -9,6 +9,7 @@ All notable changes to Sync Agent. Dates are YYYY-MM-DD.
   - Windows PowerShell 5.1 reported an empty exit code for `Start-Process -PassThru`.
   - `Get-ItemPropertyValue` threw on a missing startup value even with `-ErrorAction SilentlyContinue`.
   - Console symbols crashed `SyncAgent.exe` when the installer captured its output.
+- Reconfigure could silently throw away a new access key. Pressing Enter at the menu after entering keys cancelled; when the saved key was rejected, "Enter new AWS access credentials?" still defaulted to No and the window then closed with an error. Now the saved key is checked first (a rejected key makes "Yes" the default), unsaved changes are shown and make Save the default, cancelling asks before discarding them, and errors return to the menu.
 - A failure that repeats on every poll (wrong clock, deleted access key) filled the log with the same `WARNING ClientError` every few seconds. It is now logged once, then as "Still failing: …" every 10 minutes, followed by "Previous sync problems resolved" when it clears.
 - The tray's confirmation dialog appeared but could not be clicked; windows opened from the tray did not receive keyboard focus.
 - The setup window could disappear while waiting for input, and on Windows 11 the agent left a terminal window open. The agent now always starts without a window.

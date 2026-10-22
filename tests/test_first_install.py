@@ -175,3 +175,53 @@ def test_scan_reuses_hash_only_for_unchanged_settled_files(tmp_path):
     hashed.clear()
     assert engine._locals()['old.txt'] != first['old.txt']
     assert 'old.txt' in hashed
+
+
+def test_rejected_saved_key_defaults_to_entering_a_new_one():
+    defaults = []
+    def confirm(prompt, default=True):
+        defaults.append(default)
+        return True
+    with patch.object(wizard, 'list_profiles', return_value=['sync-agent']), patch.object(wizard, 'confirm', confirm), \
+         patch.object(wizard, 'ask', side_effect=['AKIANEW', 'new-secret', '']), patch.object(wizard, 'err'), \
+         patch.object(wizard, 'verify_aws', side_effect=[(False, 'InvalidClientTokenId'), (True, 'ok')]):
+        result = wizard._edit_access_credentials({'region': 'eu-central-1'})
+    assert defaults[0] is True and result[:2] == ('AKIANEW', 'new-secret')
+
+
+def test_working_saved_key_defaults_to_keeping_it():
+    defaults = []
+    def confirm(prompt, default=True):
+        defaults.append(default)
+        return default
+    with patch.object(wizard, 'list_profiles', return_value=['sync-agent']), patch.object(wizard, 'confirm', confirm), \
+         patch.object(wizard, 'verify_aws', return_value=(True, 'AWS account 123456789012')):
+        assert wizard._edit_access_credentials({'region': 'eu-central-1'}) is None
+    assert defaults == [False]
+
+
+def test_reconfigure_enter_after_new_keys_saves_instead_of_cancelling():
+    import reconfigure
+    keys = ('AKIANEW', 'new-secret', 'eu-central-1', '')
+    with patch('config.load_config', return_value={'workstation_id': 'ws22'}), \
+         patch.object(reconfigure, 'ensure_aws_cli'), patch.object(reconfigure, 'warn'), \
+         patch.object(reconfigure, 'edit_credentials', return_value=keys), \
+         patch('config.validate_config', side_effect=lambda cfg: cfg), \
+         patch.object(reconfigure, 'finish_settings', return_value=True) as finish:
+        answers = iter(['2', ''])  # choose Authentication, then just press Enter
+        with patch.object(reconfigure, 'ask', lambda prompt, default='': next(answers) or default):
+            assert reconfigure.run_reconfigure() is True
+    assert finish.call_args[0][1] == keys
+
+
+def test_reconfigure_cancel_with_unsaved_keys_asks_first_and_survives_errors():
+    import reconfigure
+    with patch('config.load_config', return_value={'workstation_id': 'ws22'}), \
+         patch.object(reconfigure, 'ensure_aws_cli'), patch.object(reconfigure, 'warn'), patch.object(reconfigure, 'err'), \
+         patch.object(reconfigure, 'edit_credentials', side_effect=[ValueError('rejected'), ('A', 'B', 'eu-central-1', '')]), \
+         patch.object(reconfigure, 'ask', side_effect=['2', '2', 'q', 'q']), \
+         patch.object(reconfigure, 'confirm', side_effect=[False, True]) as confirm, \
+         patch.object(reconfigure, 'finish_settings') as finish:
+        assert reconfigure.run_reconfigure() is False
+    assert confirm.call_count == 2
+    finish.assert_not_called()

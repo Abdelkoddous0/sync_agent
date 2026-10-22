@@ -117,10 +117,13 @@ def edit_credentials(cfg):
 def _edit_access_credentials(cfg):
     info('Use the dedicated sync-agent profile. Credentials are not saved until final confirmation.')
     # First installation: there is no profile to reuse, so entering keys is the useful default.
-    has_profile = config.AWS_PROFILE in list_profiles()
-    if not confirm('Enter new AWS access credentials?', default=not has_profile):
-        valid, message = verify_aws(region=cfg['region'])
-        info(message)
+    valid = False
+    if config.AWS_PROFILE in list_profiles():
+        # Check the saved key first: if AWS rejects it, replacing it is the likely intent.
+        with working('Checking the saved access key'):
+            valid, message = verify_aws(region=cfg['region'])
+        (ok if valid else err)(message)
+    if not confirm('Enter new AWS access credentials?', default=not valid):
         if not valid and not confirm('Continue with existing profile without successful verification?',default=False):
             raise ValueError('Credential verification failed. Configure the sync-agent profile and retry.')
         return None
