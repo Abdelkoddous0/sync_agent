@@ -1,839 +1,187 @@
-# ⚙️ HTE Sync Agent
+# Sync Agent
 
-> **AWS S3 Bidirectional Sync Agent for Windows**
-> Replaces SyncTrayzor / SyncThing with direct AWS S3 sync.
-> Runs silently in the system tray. Auto-starts on Windows login.
+Windows 10/11 desktop tray application for conservative file synchronization with an AWS S3 bucket prefix. The executable is `SyncAgent.exe`. It runs as the signed-in user, not as a Windows service.
 
-![Version](https://img.shields.io/badge/version-3.3.0-blue)
-![Platform](https://img.shields.io/badge/platform-Windows%2010%2F11-blue)
-![Python](https://img.shields.io/badge/python-3.10%2B-green)
-![License](https://img.shields.io/badge/license-MIT-green)
+## Safety and validation status
 
----
+Use a disposable local folder and a non-production S3 prefix for initial Windows testing. This repair has offline regression coverage; a passing Linux test run or PowerShell parse does not establish that native Windows installation, the packaged executable, or live S3 integration works. Native Windows 10 and Windows 11 acceptance testing remains required. No production AWS calls are necessary to run the tests.
 
-## Table of Contents
+- Files present only locally are uploaded, not removed to match S3.
+- Local and remote deletion propagation are both disabled by default.
+- A persistent baseline records prior file hashes and S3 ETags. Deletions observed with propagation disabled are remembered, preventing an automatic upload/download from resurrecting the deleted side.
+- If both sides changed or a path cannot be mapped safely, the application preserves both originals and reports a conflict. It does not automatically merge or create a resolution copy.
+- On first synchronization, an existing path on both sides is treated conservatively as a conflict because there is no shared baseline, even if the contents might be identical.
+- Downloads use temporary files and recheck local content before atomic replacement. S3 writes use conditional requests. Failed conditions are reported rather than retried as unconditional overwrites.
+- One worker serializes synchronization; events arriving during a transfer remain pending. Directory changes also enqueue reconciliation.
+- Windows reserved names, traversal, case/Unicode aliases, links and reparse points are rejected. These checks reduce risk but are not an OS sandbox against a malicious process that can concurrently rewrite the same filesystem tree.
+- Uploads larger than 5 GiB are refused; conditional multipart uploads are not implemented. Empty directories and metadata/ACL mirroring are not supported.
+- Enable S3 bucket versioning and maintain independent backups. Synchronization is not a backup service.
 
-- [Overview](#overview)
-- [Features](#features)
-- [File Structure](#file-structure)
-- [Architecture](#architecture)
-- [Prerequisites](#prerequisites)
-- [Build](#build)
-- [Installation](#installation)
-- [First-Time Setup](#first-time-setup)
-- [Agent Runtime](#agent-runtime)
-- [System Tray](#system-tray)
-- [CLI Commands](#cli-commands)
-- [Reconfiguration](#reconfiguration)
-- [Configuration Reference](#configuration-reference)
-- [Auto Start](#auto-start)
-- [Bidirectional Sync](#bidirectional-sync)
-- [Error Handling](#error-handling)
-- [Security](#security)
-- [Troubleshooting](#troubleshooting)
-- [Uninstall](#uninstall)
+Do not manually delete or edit the baseline to resolve conflicts: removing it changes first-sync/deletion semantics and can resurrect previously deleted data. Stop the agent, preserve copies of both sides, and resolve conflicts deliberately. Changing the local folder, bucket, prefix, profile or non-key authentication method creates a separate baseline identity. Access-key mode retains the prior profile-bound identity for compatibility; switching to a non-key method refuses an existing older identity until migration is reviewed, rather than silently dropping tombstones. Pre-release baselines that lack profile identity require explicit review/migration; the agent refuses to silently discard their tombstones and begin first sync.
 
----
+## Start here on Windows
 
-## Overview
+Follow [WINDOWS_SETUP.md](WINDOWS_SETUP.md) for the step-by-step build, installation, authentication and first-test walkthrough. Use [ACCEPTANCE.md](ACCEPTANCE.md) for the packaged Windows tests and live AWS acceptance checklist. Initial testing should leave startup and deletion propagation off.
 
-HTE Sync Agent is a lightweight Windows background service that
-watches a local folder in real time and syncs changes directly
-to and from AWS S3.
+The repository contains source and build instructions, not a Windows executable built or validated in this Linux repair session.
 
-```
-Local Folder `<->` AWS S3 Bucket `<->` ELN / HTE Portal
-```
+## Build on Windows
 
-Each workstation gets a unique ID and its own isolated S3 folder.
-Files deleted from S3 are automatically mirrored to the local folder.
+Install a supported 64-bit Python version (Python 3.12 is the Windows CI target), then run:
 
----
-
-## Features
-
-| Feature | Description |
-|---|---|
-| Bidirectional sync | Local to S3 on file change and S3 to local on poll |
-| Delete mirroring | Deletions sync in both directions |
-| CLI setup wizard | Interactive terminal wizard on first run |
-| Partial reconfigure | Change only the settings you need |
-| System tray | Silent background agent with color-coded status |
-| Auto-start | VBS launcher registers Windows Scheduled Task |
-| Live logs | Color-coded PowerShell terminal |
-| Uninstall | Full removal from tray or CLI |
-| No Python needed | Self-contained PyInstaller bundle |
-
----
-
-## File Structure
-
-```
-HTESync/
-├── main.py              Entry point and argument parser
-├── agent.py             launch_agent() coordinator
-├── config.py            Paths, load/save, startup, console
-├── helpers.py           Rich CLI helpers and AWS verify
-├── sync_engine.py       Global state, push, pull, poller
-├── watcher.py           FileSystemWatcher handler
-├── tray.py              Tray icon, menu and all actions
-├── wizard.py            Full first-time setup wizard
-├── reconfigure.py       Partial reconfiguration menu
-├── commands.py          Status, logs, uninstall commands
-├── requirements.txt     pip dependencies
-├── build.bat            PyInstaller build script
-├── install.bat          Deployment installer
-├── .gitignore           Git ignore
-└── README.md            This file
-```
-
-### Deployed Layout
-
-```
-C:\Program Files\HTESync\     App bundle (read-only)
-    HTESync.exe
-    _internal\
-
-C:\ProgramData\HTESync\       Data (always writable)
-    config.json
-    launch_agent.vbs
-    logs\
-        sync_ws22.log
-```
-
----
-
-## Architecture
-
-### System Overview
-
-```mermaid
-flowchart LR
-    subgraph WS[Workstations]
-        W1["ws22"]
-        W2["ws17"]
-        W3["ws_test01"]
-    end
-
-    subgraph AGT[HTE Sync Agent]
-        FW["File Watcher"]
-        DB["Debounce"]
-        PUSH["S3 Push"]
-        PULL["S3 Pull"]
-        TR["Tray Icon"]
-        LG["Logger"]
-    end
-
-    subgraph S3[AWS S3]
-        P1["workstations/ws22"]
-        P2["workstations/ws17"]
-        P3["workstations/ws_test01"]
-    end
-
-    subgraph DST[Downstream]
-        ELN["ELN"]
-        HTE["HTE Portal"]
-    end
-
-    W1 --> FW
-    W2 --> FW
-    W3 --> FW
-    FW --> DB
-    DB --> PUSH
-    PUSH --> TR
-    PUSH --> LG
-    PULL --> TR
-    PULL --> LG
-    PUSH --> P1
-    PUSH --> P2
-    PUSH --> P3
-    P1 --> PULL
-    P2 --> PULL
-    P3 --> PULL
-    PULL --> W1
-    PULL --> W2
-    PULL --> W3
-    P1 --> ELN
-    P2 --> ELN
-    P3 --> ELN
-    P1 --> HTE
-    P2 --> HTE
-    P3 --> HTE
-```
-
-### Module Dependency
-
-```mermaid
-flowchart TD
-    A["main.py"] --> B["agent.py"]
-    A --> C["wizard.py"]
-    A --> D["reconfigure.py"]
-    A --> E["commands.py"]
-    B --> F["sync_engine.py"]
-    B --> G["watcher.py"]
-    B --> H["tray.py"]
-    C --> I["helpers.py"]
-    D --> I
-    E --> I
-    F --> J["config.py"]
-    G --> F
-    H --> F
-    I --> J
-    C --> B
-    D --> B
-```
-
----
-
-## Prerequisites
-
-### Developer Machine (build once)
-
-| Software | Version | Install |
-|---|---|---|
-| Python | 3.10+ | [python.org](https://python.org) |
-| AWS CLI v2 | Latest | [aws.amazon.com/cli](https://aws.amazon.com/cli) |
-
-### Install Python Packages
-
-```batch
-pip install rich watchdog pystray pillow plyer boto3 pyinstaller
-```
-
-### Verify
-
-```batch
-py -c "import rich;     print('rich     OK')"
-py -c "import watchdog; print('watchdog OK')"
-py -c "import pystray;  print('pystray  OK')"
-py -c "import PIL;      print('pillow   OK')"
-py -c "import plyer;    print('plyer    OK')"
-py -c "import boto3;    print('boto3    OK')"
-aws --version
-```
-
-### Target Workstations
-
-```
-Required  : Windows 10 or 11
-Required  : AWS CLI v2
-Required  : Admin rights for install.bat only
-Not needed: Python
-Not needed: pip
-```
-
----
-
-## Build
-
-```mermaid
-flowchart TD
-    A["Run build.bat"] --> B{"Python found?"}
-    B -->|No| C["Install Python from python.org"]
-    B -->|Yes| D["Install pip packages"]
-    D --> E["Clean old build"]
-    E --> F["Run PyInstaller onedir"]
-    F --> G{"Build OK?"}
-    G -->|No| H["Fix errors and retry"]
-    G -->|Yes| I["dist/HTESync bundle ready"]
-    I --> J["Copy to workstation"]
-```
-
-```batch
+```bat
 build.bat
 ```
 
-Output:
-```
-dist\
-    HTESync\
-        HTESync.exe
-        _internal\
-```
+The build creates `.venv-build`, installs `requirements-dev.txt`, runs the complete pytest suite, and packages only `main.py` using PyInstaller. Any failing step aborts the build. `program.bat` forwards to the same build.
 
----
+Output: `dist\SyncAgent\SyncAgent.exe`, `_internal`, and the lifecycle scripts. Distribute the entire `dist\SyncAgent` folder, not just the executable. Python is not required on target workstations. This distribution targets 64-bit Windows; Windows ARM64/x86 support has not been established.
 
-## Installation
+## Install and AWS CLI detection
 
-```mermaid
-flowchart TD
-    A["Run install.bat"] --> B{"Admin rights?"}
-    B -->|No| C["Auto UAC elevation"]
-    C --> D["Stop old instance"]
-    B -->|Yes| D
-    D --> E["Remove old install"]
-    E --> F["Copy to Program Files"]
-    F --> G["Create ProgramData folders"]
-    G --> H["Register Scheduled Task via VBS"]
-    H --> I["Add Defender exclusions"]
-    I --> J["Create Desktop shortcut"]
-    J --> K["Add to PATH"]
-    K --> L{"Launch now?"}
-    L -->|Yes| M["Start agent"]
-    L -->|No| N["Done"]
-    M --> N
-```
+On the target Windows 10/11 machine, run `install.bat` from the full bundle, or from the source directory after building. Run it as the normal user.
 
-```batch
-:: Run as Administrator
+```bat
 install.bat
 ```
 
-### Simple Deployment (no install.bat)
+Default locations:
 
-```batch
-copy dist\HTESync.exe C:\ProgramData\HTESync\HTESync.exe
-C:\ProgramData\HTESync\HTESync.exe
+```text
+%LOCALAPPDATA%\Programs\SyncAgent\    application bundle
+%LOCALAPPDATA%\SyncAgent\config.json settings (no AWS secret keys)
+%LOCALAPPDATA%\SyncAgent\logs\       rotating logs
+%LOCALAPPDATA%\SyncAgent\baseline-*.json reconciliation baselines
 ```
 
-### What install.bat Does
+Installation requests confirmation, stages the bundle, checks its diagnostic entry point, requests a cooperative stop of the previous agent, and replaces the application with rollback on failure. It registers current-user startup under `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`. There are no scheduled tasks, Defender exclusions, system PATH changes, force-killed application processes, or automatic removal of older differently named products.
 
-| Step | Action |
-|---|---|
-| 1 | Auto UAC elevation |
-| 2 | Stop old running instance |
-| 3 | Remove old Program Files install |
-| 4 | Deploy bundle to Program Files |
-| 5 | Create ProgramData folders |
-| 6 | Register Scheduled Task via VBS launcher |
-| 7 | Add Windows Defender exclusions |
-| 8 | Create Desktop shortcut |
-| 9 | Add to system PATH |
-| 10 | Optionally launch agent |
+The installer/uninstaller refuse unrecognized existing application folders (ownership requires `SyncAgent.install.json` and the expected executable), configured sync-folder overlap, and unreadable settings that prevent checking overlap. Do not add an ownership marker to an unrelated directory to bypass this protection. Filesystem rollback is attempted even if restoring startup registration fails; reported registry errors may require manual repair. Startup commands exceeding the 260-character Run-key limit are rejected; `-NoStartup` avoids startup registration.
 
----
+Installer switches:
 
-## First-Time Setup
-
-Runs automatically when `config.json` does not exist.
-
-```mermaid
-flowchart TD
-    A["No config found"] --> B["Show banner"]
-    B --> C["Step 1 - Workstation ID"]
-    C --> D{"Valid?"}
-    D -->|No| E["Show error"]
-    E --> C
-    D -->|Yes| F["Step 2 - AWS Credentials"]
-    F --> G["Verify with AWS"]
-    G --> H{"Valid?"}
-    H -->|No| I["Show error and retry"]
-    I --> F
-    H -->|Yes| J["Step 3 - Sync Paths"]
-    J --> K{"Paths provided?"}
-    K -->|No| L["Show error"]
-    L --> J
-    K -->|Yes| M["Step 4 - Options"]
-    M --> N["Step 5 - Auto Start"]
-    N --> O["Step 6 - Save"]
-    O --> P["Configure AWS CLI"]
-    P --> Q["Write config.json"]
-    Q --> R{"Register task?"}
-    R -->|Yes| S["Create VBS and task"]
-    R -->|No| T["Show summary"]
-    S --> T
-    T --> U["Launch agent in tray"]
+```bat
+install.bat -NoStartup
+install.bat -SourceDir "C:\Downloads\SyncAgent"
 ```
 
-### Setup Fields
+`-Yes` bypasses the installation confirmation; do not use it without reviewing the destination and source. Installation itself does not configure credentials or access S3. Start setup explicitly afterward:
 
-| Step | Field | Example | Required |
-|---|---|---|---|
-| 1 | Workstation ID | ws22 | Yes |
-| 2 | AWS Access Key ID | AKIA... | Yes |
-| 2 | AWS Secret Key | hidden | Yes |
-| 2 | AWS Region | eu-central-1 | Yes |
-| 3 | Local Folder | C:\HTE Sync\ws22 | Yes |
-| 3 | S3 Bucket | hte-transfer-bucket | Yes |
-| 3 | S3 Prefix | workstations/ws22 | Auto |
-| 4 | Debounce | 5 seconds | Default 5 |
-| 4 | Max Retries | 3 | Default 3 |
-| 4 | Delete to S3 | No | Default No |
-| 4 | Sync from S3 | Yes | Default Yes |
-| 4 | Poll Interval | 30 seconds | Default 30 |
-| 4 | Notifications | Yes | Default Yes |
-| 4 | Recursive | Yes | Default Yes |
-| 4 | Excludes | tmp part | Default set |
-| 5 | Auto-Start | Yes | Default Yes |
-
----
-
-## Agent Runtime
-
-### Startup Sequence
-
-```mermaid
-flowchart TD
-    A["HTESync.exe launches"] --> B["Hide console window"]
-    B --> C["Load config.json"]
-    C --> D["Initialize logger"]
-    D --> E["Send startup notification"]
-    E --> F["Start FileSystemWatcher"]
-    F --> G["Start S3 poll thread"]
-    G --> H["Run initial push and pull"]
-    H --> I["Start tray icon - blocking"]
-    I --> J["Agent running silently"]
+```bat
+"%LOCALAPPDATA%\Programs\SyncAgent\SyncAgent.exe" --setup
 ```
 
-### Watch Loop
+At interactive setup and normal interactive startup, the application probes AWS CLI with a bounded `aws --version` check. If absent, it asks for approval to download and install the official current-user AWS CLI MSI. The bootstrap verifies Authenticode validity and the Amazon publisher, checks MSI exit status, then probes the installed CLI again. Cancelling the download does not silently install anything. Noninteractive/background startup fails clearly if AWS CLI is missing; it never opens an unattended installer. Diagnostics (`--status`, `--logs`, `--stop`, `--help`) do not bootstrap AWS CLI.
 
-```mermaid
-flowchart TD
-    A["Watching folder"] --> B{"File event?"}
-    B -->|No| C["Idle"]
-    C --> A
-    B -->|Yes| D{"Event type?"}
-    D -->|Created| E["Created"]
-    D -->|Modified| F["Modified"]
-    D -->|Deleted| G["Deleted"]
-    D -->|Moved| H["Moved"]
-    E --> I{"Excluded?"}
-    F --> I
-    G --> I
-    H --> I
-    I -->|Yes| A
-    I -->|No| J["Start debounce timer"]
-    J --> K{"New event in window?"}
-    K -->|Yes| J
-    K -->|No| L["Run aws s3 sync push"]
-    L --> M{"Result?"}
-    M -->|Success| N["Green tray and notify"]
-    M -->|Failed| O["Retry logic"]
-    N --> A
-    O --> A
+The sync engine uses boto3, not opposing `aws s3 sync --delete` commands. AWS CLI remains a checked prerequisite to satisfy the deployment requirement.
+
+## Setup and reconfiguration
+
+The wizard collects workstation ID, authentication method, region, local folder, bucket/prefix and sync options. Authentication choices are:
+
+1. **Access keys** (`auth_method=access_keys`, default for old configurations): new access/secret keys and an optional session token are masked and written only after final confirmation, to the dedicated `sync-agent` profile. Explicit new-key setup removes conflicting provider directives only from that dedicated profile; other AWS profiles and SSO-session sections remain intact.
+2. **Browser SSO** (`sso`): select an existing IAM Identity Center profile. The wizard validates its structure without requesting credentials, then offers browser login only after the approved settings save. Provision the organization-managed profile beforehand using `aws configure sso --profile company-sso`. IAM Identity Center must already be enabled and permissioned by your AWS administrator. The application does not provision an organization, permission set or account access.
+3. **Roles Anywhere** (`roles_anywhere`): select an existing trusted profile configured with `credential_process` and an administrator-provisioned signing helper, certificate/private-key source, trust anchor, Roles Anywhere profile and IAM role. No certificate, private key, signing helper or AWS infrastructure is provisioned/downloaded by this wizard. A credential process executes a local program when credentials are requested: inspect and trust it first. The application checks profile structure, not certificate authenticity or the helper's publisher.
+4. **AWS workload/default credential chain** (`workload_role`): do not explicitly select a profile. boto3 uses its normal provider chain, including EC2/container roles when applicable. This is NOT a role-only security boundary: environment credentials, environment-selected/default profiles and other SDK providers can take precedence. Best used in a deliberately configured AWS workload environment.
+5. **Other existing AWS profile** (`profile`): use a trusted preconfigured profile, including assume-role or other SDK-supported providers. Profile validation does not itself establish AWS permissions.
+
+Non-key options do not rewrite shared AWS configuration or credential files. Profile-based modes explicitly select the configured profile; background sync never initiates SSO browser login. SSO login separately updates AWS CLI-managed token caches, and a configured process provider can have its own side effects. Temporary credentials can refresh through the SDK, but an expired SSO login session still needs interactive sign-in again. `--login` performs that explicit browser login; `--check-auth` requests STS identity, reports the account/principal when its fields pass display validation, and can execute a selected credential helper. Neither is proof of S3 authorization.
+
+Local profile validation reads AWS configuration/credentials files without requesting credentials or executing a helper. SSO and Roles Anywhere modes refuse profiles containing competing/static credential providers. Explicit SSO login has a 300-second process timeout; STS identity checks use 5-second connection and 10-second read timeouts with one attempt. SDK timeouts do not bound third-party credential helper execution: a broken or interactive helper can still block credential resolution. Configure and test a trusted noninteractive helper before unattended sync.
+
+Presigned URLs are deliberately not a full-sync authentication mode: they grant selected object operations and do not provide the bucket listing and general conditional operations this engine requires. They would need a separate limited transfer feature.
+
+Credential files are ordinary AWS shared files, not encrypted storage. Protect them with Windows account/file permissions. The setup identity check calls STS using the selected profile; synchronization also requires S3 permissions and may incur AWS charges.
+
+```bat
+SyncAgent.exe --reconfigure
+SyncAgent.exe --reconfigure-all
 ```
 
----
+Partial reconfiguration offers identity, authentication/region, paths and sync/startup options. Cancel leaves the running agent and saved configuration untouched. Saving validates first, requests a cooperative stop, and holds the singleton lock while applying changes. Credentials/config/startup writes are rolled back on failure where possible; errors are reported. Restart is offered after a successful save. An active transfer that cannot stop in time prevents applying changes; do not force-kill it to continue.
 
-## System Tray
+## Commands
 
-### Icon Colors
+Run commands from the installed directory or use the full executable path (the installer does not modify PATH).
 
-| Color | Status |
-|---|---|
-| 🟢 Green | Idle - last sync OK |
-| 🟠 Orange | Push or pull in progress |
-| 🔴 Red | Failed or auth error |
-
-### Tray Menu
-
-```
-Workstation: ws22
-Local: C:\HTE Sync\ws22\data
-S3: s3://bucket/workstations/ws22/
-Status: OK  14:32:01
-Pull interval: 30s
-─────────────────────
-Push to S3 Now
-Pull from S3 Now
-Show Status
-Open Local Folder
-View Live Logs
-─────────────────────
-Reconfigure
-Uninstall
-─────────────────────
-Quit
+```bat
+SyncAgent.exe                       rem setup if unconfigured; otherwise run
+SyncAgent.exe --setup
+SyncAgent.exe --background          rem noninteractive; refuses missing configuration
+SyncAgent.exe --status
+SyncAgent.exe --login               rem explicit SSO browser sign-in only
+SyncAgent.exe --check-auth          rem contacts STS; may execute a profile helper
+SyncAgent.exe --logs                rem print recent log tail
+SyncAgent.exe --logs --follow
+SyncAgent.exe --stop                rem cooperative, token-scoped singleton stop
+SyncAgent.exe --reconfigure
+SyncAgent.exe --reconfigure-all
+SyncAgent.exe --uninstall
 ```
 
-### Tray Menu Flow
+The tray offers Sync now, status, SSO sign-in (when selected), AWS identity check, local folder, logs, reconfiguration, uninstallation and Quit. Maintenance opens a separate console; cancellation does not shut down the agent. Inspect logs for synchronization conflicts and failures; the tray icon is not a detailed health indicator.
 
-```mermaid
-flowchart TD
-    A["Right-click tray"] --> B["Menu opens"]
-    B --> C{"Selection?"}
-    C -->|Push to S3 Now| D["Force immediate push"]
-    C -->|Pull from S3 Now| E["Force immediate pull"]
-    C -->|Show Status| F["Desktop notification"]
-    C -->|Open Folder| G["Open Explorer"]
-    C -->|View Live Logs| H["Open PowerShell terminal"]
-    C -->|Reconfigure| I["Open reconfigure menu"]
-    C -->|Uninstall| J["Confirm then uninstall"]
-    C -->|Quit| K["Stop agent and exit"]
-```
+## Configuration
 
----
-
-## CLI Commands
-
-```mermaid
-flowchart LR
-    A["HTESync.exe"] --> B{"Argument?"}
-    B -->|none| C{"Config exists?"}
-    C -->|No| D["Run setup wizard"]
-    C -->|Yes| E["Run silent agent"]
-    B -->|reconfigure| F["Partial reconfigure menu"]
-    B -->|reconfigure-all| G["Full setup wizard"]
-    B -->|status| H["Print config table"]
-    B -->|logs| I["Open live log terminal"]
-    B -->|follow| I
-    B -->|uninstall| J["Run uninstall wizard"]
-```
-
-### Reference
-
-| Command | Description |
-|---|---|
-| `HTESync.exe` | Auto wizard or silent agent |
-| `HTESync.exe --reconfigure` | Partial reconfigure menu |
-| `HTESync.exe --reconfigure-all` | Full setup wizard from scratch |
-| `HTESync.exe --status` | Show current configuration |
-| `HTESync.exe --logs` | Open live color log terminal |
-| `HTESync.exe --follow` | Open live color log terminal |
-| `HTESync.exe --uninstall` | Run full uninstall wizard |
-
----
-
-## Reconfiguration
-
-Change only the settings you need — no need to redo everything.
-
-```mermaid
-flowchart TD
-    A["HTESync.exe --reconfigure"] --> B["Show current config"]
-    B --> C["Show menu"]
-    C --> D{"Selection?"}
-    D -->|1| E["Workstation Identity"]
-    D -->|2| F["AWS Credentials"]
-    D -->|3| G["Sync Paths"]
-    D -->|4| H["Push Options"]
-    D -->|5| I["Pull Options"]
-    D -->|6| J["Notifications"]
-    D -->|7| K["Exclude Patterns"]
-    D -->|8| L["Auto-Start"]
-    D -->|A| M["Full setup wizard"]
-    D -->|0| N["Save and exit"]
-    E & F & G & H & I & J & K & L --> B
-    N --> O["Save config and restart agent"]
-```
-
-### Menu Options
-
-| Key | Section | What Changes |
-|---|---|---|
-| 1 | Workstation Identity | workstation_id |
-| 2 | AWS Credentials | access key, secret, region |
-| 3 | Sync Paths | local_path, s3_bucket, s3_prefix |
-| 4 | Push Options | debounce, retries, delete_on_s3, recursive |
-| 5 | Pull Options | sync_from_s3, poll_interval |
-| 6 | Notifications | notifications on or off |
-| 7 | Exclude Patterns | exclude_patterns list |
-| 8 | Auto-Start | register or remove task |
-| A | All settings | runs full wizard |
-| 0 | Save and exit | saves and restarts agent |
-
----
-
-## Configuration Reference
-
-### Location
-
-```
-C:\ProgramData\HTESync\config.json
-```
-
-### Full Schema
+Settings are validated on load and saved atomically. Unknown fields, including secret-key fields, are not retained in the validated configuration or shown by `--status`. Example:
 
 ```json
 {
-  "workstation_id"   : "ws22",
-  "local_path"       : "C:\\HTE Sync\\ws22\\data",
-  "s3_bucket"        : "hte-transfer-bucket",
-  "s3_prefix"        : "workstations/ws22",
-  "region"           : "eu-central-1",
-  "debounce_secs"    : 5,
-  "max_retries"      : 3,
-  "delete_on_s3"     : false,
-  "sync_from_s3"     : true,
-  "poll_interval"    : 30,
-  "notifications"    : true,
-  "recursive"        : true,
-  "exclude_patterns" : ["*.tmp","*.part","~$*","desktop.ini","Thumbs.db"],
-  "log_file"         : "C:\\ProgramData\\HTESync\\logs\\sync_ws22.log"
+  "workstation_id": "ws22",
+  "local_path": "C:\\Users\\Example\\Documents\\SyncFiles",
+  "s3_bucket": "example-sync-bucket",
+  "s3_prefix": "workstations/ws22",
+  "region": "eu-central-1",
+  "auth_method": "access_keys",
+  "aws_profile": "sync-agent",
+  "debounce_secs": 5,
+  "poll_interval": 30,
+  "max_retries": 3,
+  "transfer_timeout": 60,
+  "recursive": true,
+  "sync_from_s3": true,
+  "delete_on_s3": false,
+  "delete_local": false,
+  "notifications": true,
+  "autostart": false,
+  "exclude_patterns": ["*.tmp", "*.part", "~$*", "desktop.ini", "Thumbs.db"]
 }
 ```
 
-### Options
+`delete_on_s3` permits propagation of a previously baselined local deletion. `delete_local` permits propagation of a previously baselined remote deletion. Neither flag authorizes clearing unrelated first-sync files. Both default to false; enabling either is destructive and should follow backup and disposable-data testing. `sync_from_s3=false` disables remote-to-local updates. The wizard leaves deletion propagation off unless already explicitly enabled in a validated configuration.
 
-| Key | Type | Default | Description |
-|---|---|---|---|
-| workstation_id | string | required | Unique machine name |
-| local_path | string | required | Folder to watch |
-| s3_bucket | string | required | S3 bucket name |
-| s3_prefix | string | required | S3 folder path |
-| region | string | eu-central-1 | AWS region |
-| debounce_secs | int | 5 | Seconds before pushing |
-| max_retries | int | 3 | Retry attempts on failure |
-| delete_on_s3 | bool | false | Mirror local deletes to S3 |
-| sync_from_s3 | bool | true | Enable S3 to local pull |
-| poll_interval | int | 30 | Seconds between S3 polls |
-| notifications | bool | true | Windows toast alerts |
-| recursive | bool | true | Watch subfolders |
-| exclude_patterns | list | see above | Files to skip |
+The local folder must be absolute and separate from the application/settings directories. Do not use a filesystem root, another application's installation, a junction or a symbolic link. Transfer timeout bounds individual SDK connection/read operations, not the duration of an entire large transfer. A stop timeout reports failure while an in-flight operation may still finish; the singleton remains held through worker shutdown.
 
----
+## AWS permissions
 
-## Auto Start
+Use a dedicated least-privilege identity restricted to the configured bucket prefix. Scope `s3:ListBucket` to that prefix with an `s3:prefix` condition; scope `s3:GetObject` and `s3:PutObject` to the corresponding object ARN. Grant `s3:DeleteObject` only if remote deletion propagation is deliberately enabled. KMS-encrypted buckets can require additional key permissions. Avoid bucket-wide wildcard write/delete grants. Review IAM and bucket policies with your AWS administrator rather than copying a broad example policy.
 
-### How It Works
+Official references:
 
-```mermaid
-flowchart TD
-    A["User logs into Windows"] --> B["Task Scheduler fires"]
-    B --> C["wscript.exe runs VBS launcher"]
-    C --> D["HTESync.exe starts with no window"]
-    D --> E["Load config.json"]
-    E --> F["Initialize logger"]
-    F --> G["Send startup notification"]
-    G --> H["Start FileSystemWatcher"]
-    H --> I["Start S3 poll thread"]
-    I --> J["Run initial push and pull"]
-    J --> K["Tray icon appears"]
-```
-
-### Task Details
-
-```
-Name      : HTESyncAgent_ws22
-Trigger   : On user login ONLOGON
-Action    : wscript.exe "C:\ProgramData\HTESync\launch_agent.vbs"
-Privilege : Highest available
-Window    : Hidden - no CMD visible
-```
-
-### Task Commands
-
-```batch
-schtasks /Query  /TN "HTESyncAgent_ws22" /FO LIST
-schtasks /Run    /TN "HTESyncAgent_ws22"
-schtasks /Change /TN "HTESyncAgent_ws22" /DISABLE
-schtasks /Change /TN "HTESyncAgent_ws22" /ENABLE
-schtasks /Delete /TN "HTESyncAgent_ws22" /F
-```
-
----
-
-## Bidirectional Sync
-
-```mermaid
-flowchart LR
-    A["Local Folder"] -- "File changed - push" --> B["S3 Bucket"]
-    B -- "Poll every 30s - pull" --> A
-    A -- "File deleted locally" --> B
-    B -- "File deleted from S3" --> A
-```
-
-### Sync Direction Summary
-
-| Direction | Trigger | Flag |
-|---|---|---|
-| Local to S3 | File change (real-time) | aws s3 sync LOCAL S3 |
-| S3 to Local | Every poll_interval seconds | aws s3 sync S3 LOCAL --delete |
-| Delete to S3 | delete_on_s3 = true | --delete on push |
-| Delete to Local | sync_from_s3 = true | --delete on pull (always on) |
-
-### Delete Behavior
-
-| delete_on_s3 | sync_from_s3 | Result |
-|---|---|---|
-| false | false | No deletions mirrored |
-| true | false | Local deletes go to S3 |
-| false | true | S3 deletes come to local |
-| true | true | Full bidirectional mirror |
-
-### Timeline
-
-```
-00:00  Agent starts - initial push and pull
-00:30  Poll fires - S3 to local check
-01:15  File deleted from S3 bucket
-01:30  Poll fires - local file removed
-```
-
----
-
-## Error Handling
-
-```mermaid
-flowchart TD
-    A["Sync fails"] --> B{"Error type?"}
-    B -->|Network| C["Retry after 30s"]
-    B -->|Auth| D["Stop and notify"]
-    B -->|Bucket| E["Stop and notify"]
-    B -->|Permission| F["Stop and notify"]
-    B -->|File locked| G["Skip and wait"]
-    C --> H{"Max retries?"}
-    H -->|No| I["Wait 30s and retry"]
-    I --> J{"Success?"}
-    J -->|Yes| K["Resume normal"]
-    J -->|No| H
-    H -->|Yes| L["Mark FAILED and notify"]
-    D --> M["Red tray icon"]
-    E --> M
-    F --> M
-    L --> M
-    M --> N{"User action?"}
-    N -->|Push Now| I
-    N -->|Reconfigure| O["Open reconfigure"]
-    N -->|View Logs| P["Open log terminal"]
-```
-
-### Error Reference
-
-| Error | Cause | Retries | Fix |
-|---|---|---|---|
-| Network timeout | No internet | Yes | Wait for connection |
-| InvalidClientTokenId | Wrong Access Key | No | Run --reconfigure |
-| SignatureDoesNotMatch | Wrong Secret Key | No | Run --reconfigure |
-| NoSuchBucket | Wrong bucket name | No | Run --reconfigure |
-| AccessDenied | IAM permissions | No | Fix IAM policy |
-| File locked | File in use | Next event | Close the file |
-
----
-
-## Security
-
-### Minimum IAM Policy
-
-```json
-{
-  "Version": "2012-10-17",
-  "Statement": [
-    {
-      "Effect": "Allow",
-      "Action": [
-        "s3:PutObject",
-        "s3:GetObject",
-        "s3:DeleteObject",
-        "s3:ListBucket"
-      ],
-      "Resource": [
-        "arn:aws:s3:::hte-transfer-bucket",
-        "arn:aws:s3:::hte-transfer-bucket/workstations/*"
-      ]
-    }
-  ]
-}
-```
-
-### Defender Exclusions Added Automatically
-
-```
-Folders  : C:\Program Files\HTESync\
-           C:\ProgramData\HTESync\
-Process  : HTESync.exe
-```
-
----
-
-## Troubleshooting
-
-```mermaid
-flowchart TD
-    A["Problem"] --> B{"Symptom?"}
-    B -->|No tray icon| C["Check Task Manager for HTESync"]
-    B -->|Not syncing| D["Run status then logs"]
-    B -->|S3 delete not local| E["Check sync_from_s3 is true"]
-    B -->|Local delete not S3| F["Check delete_on_s3 is true"]
-    B -->|Wizard fails| G["Delete config and reconfigure"]
-    B -->|Defender blocks| H["Run install.bat as Admin"]
-    B -->|No auto start| I["Re-run install.bat"]
-    B -->|Auth error| J["Run --reconfigure"]
-    B -->|Bucket error| K["Run --reconfigure"]
-```
-
-### Diagnostic Commands
-
-```batch
-tasklist | findstr HTESync
-HTESync.exe --status
-HTESync.exe --logs
-aws sts get-caller-identity
-aws s3 ls s3://your-bucket/
-schtasks /Query /TN "HTESyncAgent_ws22" /FO LIST
-type C:\ProgramData\HTESync\config.json
-```
-
----
+- AWS CLI installation: https://docs.aws.amazon.com/cli/latest/userguide/getting-started-install.html
+- IAM Identity Center provider: https://docs.aws.amazon.com/sdkref/latest/guide/feature-sso-credentials.html
+- Roles Anywhere profiles: https://docs.aws.amazon.com/sdkref/latest/guide/access-rolesanywhere.html
+- boto3 credential chain: https://docs.aws.amazon.com/boto3/latest/guide/credentials.html
+- S3 conditional writes: https://docs.aws.amazon.com/AmazonS3/latest/userguide/conditional-writes.html
+- S3 conditional deletes: https://docs.aws.amazon.com/AmazonS3/latest/userguide/conditional-deletes.html
 
 ## Uninstall
 
-### From Tray
-
-```mermaid
-flowchart TD
-    A["Tray - Uninstall"] --> B["Windows confirm dialog"]
-    B -->|No| C["Cancelled"]
-    B -->|Yes| D["Stop poller and watcher"]
-    D --> E["Open terminal window"]
-    E --> F["Stop agent process"]
-    F --> G["Remove scheduled task"]
-    G --> H["Remove Defender exclusions"]
-    H --> I["Delete Program Files"]
-    I --> J{"Keep ProgramData?"}
-    J -->|Yes| K["Keep config and logs"]
-    J -->|No| L["Delete config and logs"]
-    K --> M{"Remove AWS credentials?"}
-    L --> M
-    M -->|Yes| N["Delete aws folder"]
-    M -->|No| O["Keep credentials"]
-    N --> P["Remove shortcut"]
-    O --> P
-    P --> Q["Uninstall complete"]
+```bat
+SyncAgent.exe --uninstall
 ```
 
-### From CLI
+Alternatively, run the bundled `uninstall.bat`. Confirmation is required unless `-Yes` was explicitly supplied. The uninstaller requests a safe stop and removes the current user's application/startup registration. It preserves the sync folder, S3 objects, configuration, logs, baselines, AWS CLI and all shared AWS profiles. It does not uninstall legacy applications or remove their tasks/exclusions. Retained credentials and data must be reviewed and removed separately if appropriate.
 
-```batch
-HTESync.exe --uninstall
+## Development and validation
+
+```text
+python -m pip install -r requirements-dev.txt
+python -m pytest tests -q
+python main.py --help
+python main.py --status
 ```
 
-### Manual Commands
+Tests use temporary directories, fake stores and mocked download/MSI boundaries; never put real credentials in tests. Bootstrap and lifecycle behavior can also be tested with portable PowerShell using `SYNC_AGENT_TEST_PWSH=/absolute/path/to/pwsh`; those runs mock process, network and registry boundaries and do not establish native Windows behavior. Native Windows locks, signatures, MSI execution and frozen GUI behavior still require Windows acceptance tests. The GitHub Actions Windows workflow parses PowerShell, runs the offline suite, builds the bundle, smoke-tests packaged `--help`, and opts into the native packaged install/upgrade/uninstall and junction tests on its disposable Windows runner. A workflow definition is not evidence that the workflow has run successfully. The workflow is manual-only (`workflow_dispatch`) to avoid automatic runner usage: open the repository's Actions tab, select **Windows distribution**, then **Run workflow** when you are ready to consume Actions minutes. Uploading or pushing alone does not trigger it. Windows runner/server testing also does not replace separate Windows 10 and Windows 11 desktop acceptance.
 
-```batch
-taskkill /IM HTESync.exe /F
-schtasks /Delete /TN "HTESyncAgent_ws22" /F
-powershell Remove-MpPreference -ExclusionPath "C:\Program Files\HTESync"
-powershell Remove-MpPreference -ExclusionPath "C:\ProgramData\HTESync"
-powershell Remove-MpPreference -ExclusionProcess "HTESync.exe"
-rmdir /s /q "C:\Program Files\HTESync"
-rmdir /s /q "C:\ProgramData\HTESync"
-```
-
----
-
-## Quick Reference
-
-```
-PATHS
-  App    : C:\Program Files\HTESync\HTESync.exe
-  Config : C:\ProgramData\HTESync\config.json
-  Logs   : C:\ProgramData\HTESync\logs\
-  VBS    : C:\ProgramData\HTESync\launch_agent.vbs
-
-COMMANDS
-  HTESync.exe                   Auto wizard or agent
-  HTESync.exe --reconfigure     Partial reconfigure menu
-  HTESync.exe --reconfigure-all Full setup wizard
-  HTESync.exe --status          Show configuration
-  HTESync.exe --logs            Live log terminal
-  HTESync.exe --uninstall       Uninstall wizard
-
-TRAY COLORS
-  Green  = Idle or last sync OK
-  Orange = Sync in progress
-  Red    = Failed or auth error
-
-SYNC DIRECTION
-  Local to S3  = Real-time on file change
-  S3 to Local  = Every poll_interval seconds
-
-BUILD AND DEPLOY
-  Build   : build.bat on dev machine
-  Install : install.bat as Admin on workstation
-  Remove  : HTESync.exe --uninstall
-```
-
----
-
-*HTE Sync Agent v3.3 — Clariant HTE Team — 2026*
+Before release, test the full bundle on separate clean Windows 10 and Windows 11 installations: missing/present AWS CLI, declined setup, existing-profile preservation, paths with spaces/non-ASCII, login startup, two-instance rejection, stop during transfer, cancelled reconfiguration/uninstall, successful upgrade and failure rollback, retained user data, and uninstall. Then use disposable AWS objects to verify conflicts, deletion defaults, conditional-write failure and restart behavior before any valuable-data deployment.

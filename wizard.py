@@ -1,260 +1,229 @@
-# ================================================================
-#  wizard.py — Full first-time setup wizard
-# ================================================================
-import subprocess
+"""Interactive setup and staged reconfiguration; saving is always explicit."""
+import json
+import os
 from pathlib import Path
+import re
+import subprocess
 
-from config  import (CONFIG_PATH, LOG_DIR, load_config,
-                     save_config, register_startup, show_console)
-from helpers import (con, banner, step, ok, err, info,
-                     ask, confirm, verify_aws)
-from rich.rule  import Rule
-from rich.panel import Panel
-from rich.table import Table
-from rich       import box
+import config
+from helpers import ask, ask_int, banner, confirm, err, info, ok, save_credentials, verify_aws
 
 
-def run_setup(reconfigure: bool = False):
-    show_console()
-    banner()
+def ensure_aws_cli(**kwargs):
+    from aws_cli import ensure_aws_cli as ensure
+    return ensure(**kwargs)
 
-    if reconfigure:
-        con.print(Panel(
-            "[yellow]Full reconfiguration — "
-            "all settings will be overwritten.[/]",
-            border_style="yellow", padding=(0, 2)
-        ))
-        con.print()
 
-    existing = {}
-    if CONFIG_PATH.exists():
+def edit_identity(cfg):
+    while True:
+        value = ask('Workstation ID (letters, digits, underscore, hyphen)', cfg.get('workstation_id',''))
+        if re.fullmatch(r'[A-Za-z0-9_-]{1,64}',value):
+            cfg['workstation_id'] = value
+            return
+        err('Use 1–64 ASCII letters, digits, underscores or hyphens.')
+
+
+def validate_auth_profile(cfg):
+    from authentication import validate_auth_profile as validate
+    return validate(cfg)
+
+
+def login_sso(cfg):
+    from authentication import login_sso as login
+    return login(cfg)
+
+
+def verify_identity(cfg):
+    from authentication import verify_identity as verify
+    return verify(cfg)
+
+
+def edit_credentials(cfg):
+    cfg['region'] = ask('AWS region', cfg.get('region','eu-central-1'))
+    choices = {'1':'access_keys','2':'sso','3':'roles_anywhere','4':'workload_role','5':'profile'}
+    current = cfg.get('auth_method','access_keys')
+    default = next((key for key,value in choices.items() if value == current),'1')
+    info('1 Access keys (dedicated profile)   2 Browser SSO (configured profile)')
+    info('3 Roles Anywhere (configured certificate-helper profile)')
+    info('4 AWS workload/default SDK credential chain   5 Other existing AWS profile')
+    while True:
+        choice = ask('Authentication method',default)
+        if choice in choices:
+            break
+        err('Choose 1, 2, 3, 4 or 5. Presigned URLs cannot provide full synchronization.')
+    method = choices[choice]
+    cfg['auth_method'] = method
+    if method == 'access_keys':
+        cfg['aws_profile'] = config.AWS_PROFILE
+        return _edit_access_credentials(cfg)
+    if method == 'workload_role':
+        cfg['aws_profile'] = None
+        info('Uses the standard SDK credential chain, NOT a guarantee of role-only credentials.')
+        info('Environment variables and default profiles can take precedence over workload roles.')
+    else:
+        if method == 'sso':
+            info('First provision a profile using: aws configure sso --profile YOUR_PROFILE')
+            info('This step only selects it. Browser sign-in is offered after saving.')
+        elif method == 'roles_anywhere':
+            info('Your administrator must provision a trusted AWS signing helper and certificate profile.')
+            info('The selected credential_process may execute a local program when credentials are requested.')
+        else:
+            info('Select a trusted preconfigured AWS profile; its credential process may execute local programs.')
+        cfg['aws_profile'] = ask('Existing AWS profile name',cfg.get('aws_profile') or config.AWS_PROFILE)
+    validate_auth_profile(cfg)
+    info('No AWS profile files changed. Identity verification is offered only after saving.')
+    return None
+
+
+def _edit_access_credentials(cfg):
+    info('Use the dedicated sync-agent profile. Credentials are not saved until final confirmation.')
+    if not confirm('Enter new AWS access credentials?', default=False):
+        valid, message = verify_aws(region=cfg['region'])
+        info(message)
+        if not valid and not confirm('Continue with existing profile without successful verification?',default=False):
+            raise ValueError('Credential verification failed. Configure the sync-agent profile and retry.')
+        return None
+    access = ask('AWS access key ID')
+    secret = ask('AWS secret access key', password=True)
+    token = ask('Session token (blank for long-lived credentials)', password=True)
+    if not access or not secret:
+        raise ValueError('Both access key and secret key are required.')
+    valid, message = verify_aws(access,secret,cfg['region'],token)
+    info(message)
+    if not valid and not confirm('Save unverified credentials anyway?',default=False):
+        raise ValueError('Credentials were not accepted; no settings saved.')
+    return (access,secret,cfg['region'],token)
+
+
+def edit_paths(cfg):
+    cfg['local_path'] = ask('Absolute local sync folder', cfg.get('local_path',str(Path.home()/'Sync Agent Data')))
+    cfg['s3_bucket'] = ask('S3 bucket (name only)',cfg.get('s3_bucket',''))
+    cfg['s3_prefix'] = ask('S3 prefix',cfg.get('s3_prefix',f"workstations/{cfg.get('workstation_id','workstation')}"))
+
+
+def edit_options(cfg):
+    cfg['debounce_secs'] = ask_int('Debounce seconds',cfg.get('debounce_secs',5),0,3600)
+    cfg['max_retries'] = ask_int('Maximum attempts',cfg.get('max_retries',3),1,10)
+    cfg['poll_interval'] = ask_int('Remote poll interval seconds',cfg.get('poll_interval',30),5,86400)
+    cfg['transfer_timeout'] = ask_int('Transfer socket timeout seconds',cfg.get('transfer_timeout',120),10,3600)
+    cfg['sync_from_s3'] = confirm('Download new/changed S3 objects?',cfg.get('sync_from_s3',True))
+    cfg['recursive'] = confirm('Include subfolders?',cfg.get('recursive',True))
+    info('Deletion propagation is OFF by default. Enable only after backing up and testing.')
+    cfg['delete_on_s3'] = confirm('Propagate baseline-confirmed local deletions to S3?',cfg.get('delete_on_s3',False))
+    cfg['delete_local'] = confirm('Propagate baseline-confirmed remote deletions locally?',cfg.get('delete_local',False))
+    defaults = cfg.get('exclude_patterns',['*.tmp','*.part','~$*','desktop.ini','Thumbs.db'])
+    cfg['exclude_patterns'] = [p.strip() for p in ask('Exclude globs, comma-separated',', '.join(defaults)).split(',') if p.strip()]
+    cfg['autostart'] = confirm('Start on current-user Windows login?',cfg.get('autostart',False))
+
+
+def collect_settings(existing=None):
+    cfg = dict(existing or {})
+    edit_identity(cfg)
+    credentials = edit_credentials(cfg)
+    edit_paths(cfg)
+    edit_options(cfg)
+    return config.validate_config(cfg), credentials
+
+
+def apply_settings(cfg, credentials=None):
+    """Stop before modifying settings; roll back credential/config/startup writes on failure."""
+    checked = config.validate_config(cfg)
+    if checked.get('auth_method','access_keys') != 'access_keys':
+        if credentials:
+            raise ValueError('Staged access keys cannot be saved with another authentication method.')
+        validate_auth_profile(checked)
+    from commands import cmd_stop
+    from runtime import RuntimeGuard
+    cmd_stop()
+    guard = RuntimeGuard()
+    if not guard.acquire():
+        raise RuntimeError('Another Sync Agent process started during maintenance. Retry after stopping it.')
+    try:
+        return _apply_settings_locked(checked, credentials)
+    finally:
+        guard.close()
+
+
+def _apply_settings_locked(checked, credentials):
+    paths = [config.CONFIG_PATH]
+    if credentials:
+        paths.extend([Path(os.environ.get('AWS_CONFIG_FILE',str(Path.home()/'.aws'/'config'))),
+                      Path(os.environ.get('AWS_SHARED_CREDENTIALS_FILE',str(Path.home()/'.aws'/'credentials')))])
+    previous = {path: path.read_bytes() if path.exists() else None for path in paths}
+    old_startup = None
+    if os.name == 'nt':
+        import winreg
         try:
-            existing = load_config()
-        except Exception:
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER,config.RUN_KEY) as key:
+                old_startup = winreg.QueryValueEx(key,config.APP_ID)
+        except FileNotFoundError:
             pass
-
-    TOTAL = 6
-
-    # ── Step 1: Workstation ID ───────────────────────────────
-    step(1, TOTAL, "Workstation Identity")
-    info("Unique name — no spaces allowed.")
-    info("Examples: ws22  ws_test01  hte_lab3")
-    con.print()
-
-    while True:
-        ws_id = ask("Workstation ID",
-                    default=existing.get("workstation_id", ""))
-        if not ws_id:
-            err("Required.")
-        elif " " in ws_id:
-            err("No spaces — use underscores.")
+    try:
+        Path(checked['local_path']).mkdir(parents=True,exist_ok=True)
+        if credentials:
+            save_credentials(*credentials)
+        if checked['autostart']:
+            if not config.register_startup():
+                raise RuntimeError('Could not register current-user startup. No administrator rights are needed.')
         else:
-            ok(f"ID: [cyan]{ws_id}[/]")
-            break
+            config.remove_startup()
+        config.save_config(checked)
+    except Exception:
+        from helpers import _atomic_bytes
+        for path, original in previous.items():
+            if original is None:
+                path.unlink(missing_ok=True)
+            else:
+                _atomic_bytes(path,original)
+        if os.name == 'nt':
+            if old_startup is None:
+                config.remove_startup()
+            else:
+                with winreg.CreateKey(winreg.HKEY_CURRENT_USER,config.RUN_KEY) as key:
+                    winreg.SetValueEx(key,config.APP_ID,0,old_startup[1],old_startup[0])
+        raise
+    return checked
 
-    # ── Step 2: AWS Credentials ──────────────────────────────
-    step(2, TOTAL, "AWS Credentials")
-    info("Stored locally in AWS CLI profile.")
-    con.print()
 
-    while True:
-        ak = ask("AWS Access Key ID",
-                 default=existing.get("_ak_hint", ""))
-        if not ak:
-            err("Required.")
-            continue
-        sk = ask("AWS Secret Access Key", password=True)
-        if not sk:
-            err("Required.")
-            continue
-        region = ask("AWS Region",
-                     default=existing.get("region",
-                                          "eu-central-1")
-                     ) or "eu-central-1"
-        con.print()
-        valid, msg = verify_aws(ak, sk, region)
-        if valid:
-            ok(f"Valid — Account: [green]{msg}[/]")
-            break
+def finish_settings(cfg, credentials):
+    print(json.dumps(cfg,indent=2))
+    if not confirm('Save these settings? The current agent will stop.',default=False):
+        info('Cancelled. Configuration and credentials unchanged; running agent left alone.')
+        return False
+    apply_settings(cfg,credentials)
+    ok(f'Settings saved to {config.CONFIG_PATH}.')
+    method = cfg.get('auth_method','access_keys')
+    verify_now = False
+    if method == 'sso':
+        if confirm('Sign in to the selected SSO profile in your browser now?',default=True):
+            login_sso(cfg)
+            verify_now = True
         else:
-            err(f"Error: {msg}")
-            if not confirm("Try again?", default=True):
-                con.print("\n[yellow]Proceeding without verify.[/]\n")
-                break
+            info('Sign in later with SyncAgent.exe --login. Background mode never opens a browser.')
+    elif method != 'access_keys':
+        verify_now = confirm('Verify AWS identity now? This may contact AWS and execute a configured credential helper.',default=True)
+    if verify_now:
+        valid, message = verify_identity(cfg)
+        info(message)
+        if not valid:
+            info('Settings are saved, but the agent was not started. Fix authentication before starting it.')
+            return True
+    if confirm('Start Sync Agent now?',default=True):
+        subprocess.Popen(config.launch_command('--background'),close_fds=True)
+        info('Start requested. Use --status and --logs to confirm runtime health.')
+    return True
 
-    # ── Step 3: Sync Paths ───────────────────────────────────
-    step(3, TOTAL, "Sync Paths")
-    con.print()
 
-    default_lp = existing.get(
-        "local_path", f"C:\\HTE Sync\\{ws_id}\\data"
-    )
-    while True:
-        local_path = ask("Local folder to watch",
-                         default=default_lp)
-        if not local_path:
-            err("Required.")
-        else:
-            Path(local_path).mkdir(parents=True, exist_ok=True)
-            ok(f"Local: [cyan]{local_path}[/]")
-            break
-
-    while True:
-        bucket = ask("S3 Bucket name",
-                     default=existing.get("s3_bucket", ""))
-        if not bucket:
-            err("Required.")
-        else:
-            break
-
-    default_pfx = existing.get(
-        "s3_prefix", f"workstations/{ws_id}"
-    )
-    prefix = (
-        ask("S3 Folder prefix", default=default_pfx)
-        or f"workstations/{ws_id}"
-    )
-    ok(f"S3: [cyan]s3://{bucket}/{prefix}/[/]")
-
-    # ── Step 4: Options ──────────────────────────────────────
-    step(4, TOTAL, "Sync Options")
-    con.print()
-
-    debounce = int(
-        ask("Debounce delay (seconds)",
-            default=str(existing.get("debounce_secs", 5)))
-        or 5
-    )
-    max_retries = int(
-        ask("Max retries on failure",
-            default=str(existing.get("max_retries", 3)))
-        or 3
-    )
-    delete_on_s3 = confirm(
-        "Mirror local deletions to S3?",
-        default=existing.get("delete_on_s3", False)
-    )
-    sync_from_s3 = confirm(
-        "Enable S3 to Local sync?",
-        default=existing.get("sync_from_s3", True)
-    )
-    poll_interval = 30
-    if sync_from_s3:
-        poll_interval = int(
-            ask("How often to check S3 (seconds)",
-                default=str(existing.get("poll_interval", 30)))
-            or 30
-        )
-        info(
-            f"S3 checked every {poll_interval}s. "
-            "Files deleted from S3 removed locally."
-        )
-    notifications = confirm(
-        "Show Windows notifications?",
-        default=existing.get("notifications", True)
-    )
-    recursive = confirm(
-        "Watch subfolders recursively?",
-        default=existing.get("recursive", True)
-    )
-    default_exc = ", ".join(
-        existing.get("exclude_patterns",
-                     ["*.tmp", "*.part", "~$*",
-                      "desktop.ini", "Thumbs.db"])
-    )
-    exc_raw  = ask("Exclude patterns", default=default_exc)
-    excludes = [
-        p.strip() for p in exc_raw.split(",") if p.strip()
-    ]
-
-    # ── Step 5: Auto-Start ───────────────────────────────────
-    step(5, TOTAL, "Windows Auto-Start")
-    info("Starts silently on login — no CMD window visible.")
-    con.print()
-
-    register_on_boot = confirm(
-        "Register auto-start on Windows login?",
-        default=True
-    )
-
-    # ── Step 6: Save ─────────────────────────────────────────
-    step(6, TOTAL, "Saving Configuration")
-    con.print()
-
-    from rich.live    import Live
-    from rich.spinner import Spinner
-
-    with Live(
-        Spinner("dots", text=" [dim]Configuring AWS CLI...[/]"),
-        console=con, transient=True
-    ):
-        for key, val in [
-            ("aws_access_key_id",     ak),
-            ("aws_secret_access_key", sk),
-            ("region",                region),
-            ("output",                "json"),
-        ]:
-            subprocess.run(
-                ["aws", "configure", "set", key, val],
-                capture_output=True
-            )
-    ok("AWS CLI credentials configured.")
-
-    import sys
-    config = {
-        "workstation_id"  : ws_id,
-        "local_path"      : local_path,
-        "s3_bucket"       : bucket,
-        "s3_prefix"       : prefix,
-        "region"          : region,
-        "debounce_secs"   : debounce,
-        "max_retries"     : max_retries,
-        "delete_on_s3"    : delete_on_s3,
-        "sync_from_s3"    : sync_from_s3,
-        "poll_interval"   : poll_interval,
-        "notifications"   : notifications,
-        "recursive"       : recursive,
-        "exclude_patterns": excludes,
-        "log_file"        : str(LOG_DIR / f"sync_{ws_id}.log"),
-    }
-    save_config(config)
-    ok(f"Config saved: [dim]{CONFIG_PATH}[/]")
-
-    if register_on_boot:
-        if register_startup(ws_id, sys.executable):
-            ok("Startup task registered.")
-        else:
-            err("Could not register (try as Administrator).")
-
-    # Summary
-    con.print()
-    con.print(Rule("[green]Summary[/]", style="green"))
-    con.print()
-    t = Table(box=box.ROUNDED, border_style="dim",
-              show_header=False, padding=(0, 2))
-    t.add_column(style="dim",       width=22)
-    t.add_column(style="cyan bold", overflow="fold")
-    t.add_row("Workstation",   ws_id)
-    t.add_row("Local Path",    local_path)
-    t.add_row("S3 Target",     f"s3://{bucket}/{prefix}/")
-    t.add_row("Region",        region)
-    t.add_row("Debounce",      f"{debounce}s")
-    t.add_row("Max Retries",   str(max_retries))
-    t.add_row("Delete on S3",  "Yes" if delete_on_s3 else "No")
-    t.add_row("Sync from S3",
-              f"Yes — every {poll_interval}s"
-              if sync_from_s3 else "No")
-    t.add_row("Notifications", "On" if notifications else "Off")
-    t.add_row("Auto-Start",    "Yes" if register_on_boot else "No")
-    t.add_row("Excludes",      ", ".join(excludes))
-    con.print(t)
-    con.print()
-    con.print(Panel(
-        "[bold green]Setup complete![/]\n\n"
-        "[dim]Starting agent in system tray...[/]",
-        border_style="green", padding=(0, 4)
-    ))
-    con.print()
-
-    from agent import launch_agent
-    launch_agent(config)
+def run_setup(reconfigure=False):
+    config.show_console()
+    banner()
+    ensure_aws_cli(interactive=True)
+    existing = {}
+    if config.CONFIG_PATH.exists():
+        try:
+            existing = config.load_config()
+        except ValueError:
+            if not confirm('Existing configuration is invalid. Replace it after reviewing all fields?',default=False):
+                return False
+    cfg, credentials = collect_settings(existing)
+    return finish_settings(cfg,credentials)

@@ -10,3 +10,22 @@ venv/
 config.json
 logs/
 launch_agent.vbs
+
+# Local build/test environments and caches
+.venv-build/
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Machine-specific settings, AWS credentials and private key material
+.env
+.env.*
+!.env.example
+.aws/
+credentials
+*.pem
+*.key
+*.p12
+*.pfx
+baseline-*.json
+*.log

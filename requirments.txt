@@ -1,7 +1,2 @@
-rich
-watchdog
-pystray
-pillow
-plyer
-boto3
-pyinstaller
+# Compatibility with the historical misspelled filename.
+-r requirements.txt

@@ -1,222 +1,363 @@
-# ================================================================
-#  sync_engine.py — Global state, push, pull, S3 poller
-# ================================================================
-import logging, threading, subprocess, time
-from datetime import datetime
+"""Serialized per-file reconciliation. No CLI mirrors or implicit deletes.
+
+SyncEngine(cfg, store=None, state_path=None): inject a store for offline use.
+sync() -> {conflicts: list, errors: list, changed: list} runs synchronously,
+serialized against all other passes. request_sync(reason='event', immediate=False)
+queues a trailing-debounced pass, retaining requests made during a running pass.
+start() starts one worker; stop(timeout=30)->bool waits for it. Conflicts keep
+both originals untouched and are retried/reported until explicitly resolved.
+Store interface: list()->{relative_name: opaque_version}, download(name, binary
+file, expected_version, stop_event), upload(name, binary_file, expected_version)
+->new_version, delete(name, expected_version). None means expected absence.
+"""
+import fnmatch
+import hashlib
+import json
+import logging
+import os
 from pathlib import Path
-
-from PIL    import Image, ImageDraw
-from plyer  import notification
-
-from config import LOG_DIR
-
-# ── Global state ─────────────────────────────────────────────────
-cfg          : dict                    = {}
-observer                               = None
-tray_ref                               = None
-last_sync    : float                   = 0.0
-sync_status  : str                     = "Idle"
-sync_lock    : threading.Lock          = threading.Lock()
-poll_running : bool                    = False
-poll_thread  : threading.Thread | None = None
+import stat
+import tempfile
+import threading
+import time
+import unicodedata
 
 
-# ── Logger ───────────────────────────────────────────────────────
-def init_logger(ws_id: str):
-    log_path = LOG_DIR / f"sync_{ws_id}.log"
-    logging.basicConfig(
-        filename=str(log_path),
-        level=logging.INFO,
-        format="%(asctime)s [%(levelname)s] %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S"
-    )
-
-
-# ── Tray icon ────────────────────────────────────────────────────
-def make_icon(color=(34, 197, 94)) -> Image.Image:
-    img  = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
-    draw = ImageDraw.Draw(img)
-    draw.ellipse([2, 2, 62, 62], fill=color)
-    draw.polygon([(18, 34), (30, 46), (48, 20)], fill="white")
-    return img
-
-
-def update_tray():
-    if not tray_ref:
-        return
+def atomic_json(path, data):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, temp = tempfile.mkstemp(prefix='.state-', dir=path.parent)
     try:
-        if "Failed" in sync_status or "Error" in sync_status:
-            col = (220, 53, 69)
-        elif any(x in sync_status
-                 for x in ["Syncing", "Pushing", "Pulling"]):
-            col = (255, 153, 0)
-        else:
-            col = (34, 197, 94)
-        tray_ref.icon  = make_icon(col)
-        tray_ref.title = (
-            f"HTE Sync [{cfg.get('workstation_id','')}]"
-            f" — {sync_status}"
-        )
-    except Exception:
-        pass
+        with os.fdopen(fd, 'w', encoding='utf-8') as f:
+            json.dump(data, f, ensure_ascii=True)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(temp, path)
+    finally:
+        Path(temp).unlink(missing_ok=True)
 
 
-def desktop_notify(title: str, msg: str):
-    if not cfg.get("notifications", True):
-        return
-    try:
-        notification.notify(
-            title=title, message=msg,
-            app_name="HTE Sync", timeout=4
-        )
-    except Exception:
-        pass
+def safe_name(name):
+    if not isinstance(name, str) or not name or '\\' in name:
+        return False
+    for part in name.split('/'):
+        if (part in ('', '.', '..') or part[-1:] in (' ', '.')
+                or any(ord(c) < 32 or c in '<>:"|?*' for c in part)
+                or part.split('.')[0].upper() in {'CON','PRN','AUX','NUL','CONIN$','CONOUT$',
+                    *(f'COM{i}' for i in '123456789¹²³'), *(f'LPT{i}' for i in '123456789¹²³')}):
+            return False
+    return True
 
 
-# ── Commands ─────────────────────────────────────────────────────
-def _build_push_cmd() -> list[str]:
-    cmd = [
-        "aws", "s3", "sync",
-        cfg["local_path"],
-        f"s3://{cfg['s3_bucket']}/{cfg['s3_prefix']}/"
-    ]
-    if cfg.get("delete_on_s3"):
-        cmd.append("--delete")
-    for pat in cfg.get("exclude_patterns", []):
-        cmd += ["--exclude", pat]
-    return cmd
+def linked(path):
+    info = path.lstat()
+    return stat.S_ISLNK(info.st_mode) or bool(getattr(info, 'st_file_attributes', 0) & 0x400)
 
 
-def _build_pull_cmd() -> list[str]:
-    cmd = [
-        "aws", "s3", "sync",
-        f"s3://{cfg['s3_bucket']}/{cfg['s3_prefix']}/",
-        cfg["local_path"],
-        "--delete"
-    ]
-    for pat in cfg.get("exclude_patterns", []):
-        cmd += ["--exclude", pat]
-    return cmd
+class SyncEngine:
+    def __init__(self, cfg, store=None, state_path=None):
+        self.cfg = dict(cfg)
+        self.root = Path(cfg['local_path']).absolute()
+        if store is None:
+            from storage import S3Store
+            store = S3Store(cfg)
+        self.store = store
+        if state_path is None:
+            from config import DATA_DIR
+            fields = [str(self.root), cfg['s3_bucket'], cfg.get('s3_prefix',''), cfg.get('aws_profile','sync-agent')]
+            prior_identity = json.dumps(fields)
+            auth_method = cfg.get('auth_method', 'access_keys')
+            if auth_method != 'access_keys':
+                fields.append(auth_method)
+            identity = json.dumps(fields)
+            state_path = DATA_DIR / ('baseline-' + hashlib.sha256(identity.encode()).hexdigest() + '.json')
+            prior = DATA_DIR / ('baseline-' + hashlib.sha256(prior_identity.encode()).hexdigest() + '.json')
+            if not state_path.exists() and prior != state_path and prior.exists():
+                raise ValueError('Authentication baseline requires explicit migration review; refusing a fresh baseline')
+            legacy_identity = json.dumps([str(self.root), cfg['s3_bucket'], cfg.get('s3_prefix','')])
+            legacy = DATA_DIR / ('baseline-' + hashlib.sha256(legacy_identity.encode()).hexdigest() + '.json')
+            if not state_path.exists() and legacy.exists():
+                raise ValueError('Legacy baseline requires explicit profile/migration review; refusing a fresh baseline')
+        self.state_path = Path(state_path)
+        self.baseline = {}
+        if self.state_path.exists():
+            state = json.loads(self.state_path.read_text(encoding='utf-8'))
+            if state.get('version') != 1 or not isinstance(state.get('files'), dict):
+                raise ValueError('Invalid baseline; refusing unsafe first-sync fallback')
+            self.baseline = state['files']
+        self._lock = threading.Lock()
+        self._condition = threading.Condition()
+        self._stop = threading.Event()
+        self._due = None
+        self._immediate_pending = False
+        self._worker = None
+        self.last_report = {'conflicts':[], 'errors':[], 'changed':[]}
+
+    def _path(self, name, create=False):
+        if not safe_name(name):
+            raise ValueError('Unsafe Windows path: ' + name)
+        # Never resolve away a junction/symlink before checking it.
+        chain = [self.root, *self.root.parents]
+        for path in reversed(chain):
+            if path.exists() and linked(path):
+                raise ValueError('Symlink/reparse root')
+        path = self.root
+        for part in name.split('/'):
+            if path.exists() and not path.is_dir():
+                raise ValueError('Non-directory ancestor')
+            if create:
+                path.mkdir(exist_ok=True)
+            path = path / part
+            if path.is_symlink() or (path.exists() and linked(path)):
+                raise ValueError('Symlink/reparse path')
+        return path
+
+    def _fingerprint(self, name):
+        path = self._path(name)
+        try:
+            if not path.is_file():
+                if path.exists():
+                    raise ValueError('Destination is not a file')
+                return None
+            before = path.stat()
+            h = hashlib.sha256()
+            with path.open('rb') as f:
+                for block in iter(lambda: f.read(1024*1024), b''):
+                    if self._stop.is_set():
+                        raise InterruptedError('Stopping')
+                    h.update(block)
+            after = path.stat()
+            if (before.st_size, before.st_mtime_ns, before.st_ino) != (after.st_size, after.st_mtime_ns, after.st_ino):
+                raise ValueError('Local file changed while reading')
+            return h.hexdigest()
+        except FileNotFoundError:
+            return None
+
+    def _included(self, name):
+        return ((self.cfg.get('recursive', True) or '/' not in name)
+                and not any(fnmatch.fnmatchcase(name, p) or fnmatch.fnmatchcase(Path(name).name, p)
+                            for p in self.cfg.get('exclude_patterns', []))
+                and not Path(name).name.startswith('.sync-agent-'))
+
+    def _locals(self):
+        if not self.root.is_dir():
+            raise ValueError('Local root missing; refusing to interpret as deletion')
+        self._path('_probe_')
+        result = {}
+        def fail_scan(error):
+            raise error
+        for base, dirs, files in os.walk(self.root, followlinks=False, onerror=fail_scan):
+            for name in list(dirs):
+                p = Path(base)/name
+                if linked(p):
+                    raise ValueError('Symlink/reparse directory: ' + str(p))
+            if not self.cfg.get('recursive',True):
+                dirs[:] = []
+            for file in files:
+                name = (Path(base)/file).relative_to(self.root).as_posix()
+                if self._included(name):
+                    result[name] = self._fingerprint(name)
+        return result
+
+    def _download(self, name, remote, local):
+        target = self._path(name, create=True)
+        fd, temp = tempfile.mkstemp(prefix='.sync-agent-', dir=target.parent)
+        try:
+            with os.fdopen(fd, 'wb') as f:
+                self.store.download(name, f, remote, self._stop)
+                f.flush()
+                os.fsync(f.fileno())
+            if self._stop.is_set():
+                raise InterruptedError('Stopping')
+            if self._fingerprint(name) != local:
+                raise ValueError('Local change during download')
+            self._path(name)
+            os.replace(temp, target)
+            return self._fingerprint(name)
+        finally:
+            Path(temp).unlink(missing_ok=True)
+
+    def sync(self):
+        with self._lock:
+            report = {'conflicts':[], 'errors':[], 'changed':[]}
+            try:
+                local = self._locals()
+                remote = {k:v for k,v in self.store.list().items() if self._included(k)}
+                names = set(local) | set(remote) | set(self.baseline)
+                # Reject case/Unicode aliases, including aliases of ancestor directories.
+                aliases = {}
+                blocked = set()
+                for name in sorted(names):
+                    if not safe_name(name):
+                        blocked.add(name)
+                        continue
+                    parts = name.split('/')
+                    for i in range(1, len(parts)+1):
+                        component = '/'.join(parts[:i])
+                        alias = unicodedata.normalize('NFC', component).casefold()
+                        aliases.setdefault(alias, set()).add(component)
+                collisions = {a for a, values in aliases.items() if len(values)>1}
+                for name in names:
+                    if any(unicodedata.normalize('NFC','/'.join(name.split('/')[:i])).casefold() in collisions
+                           for i in range(1,len(name.split('/'))+1)):
+                        blocked.add(name)
+                for name in sorted(names):
+                    if self._stop.is_set():
+                        break
+                    if name in blocked:
+                        report['conflicts'].append(name + ': unsafe/colliding path')
+                        continue
+                    if not self._included(name):
+                        continue
+                    l, r = local.get(name), remote.get(name)
+                    old = self.baseline.get(name)
+                    try:
+                        if old is None:
+                            if l is not None and r is not None:
+                                # No trusted baseline: never choose a winner by timestamp/ETag.
+                                report['conflicts'].append(name + ': untracked on both sides')
+                                continue
+                            action = 'upload' if l is not None else 'download'
+                        else:
+                            lc, rc = l != old['local'], r != old['remote']
+                            if not lc and not rc:
+                                continue
+                            if lc and rc:
+                                if l is None and r is None:
+                                    self.baseline[name] = {'local':None, 'remote':None}
+                                    continue
+                                report['conflicts'].append(name + ': both sides changed')
+                                continue
+                            action = 'upload' if lc else 'download'
+                            if action == 'upload' and l is None:
+                                if r is not None and self.cfg.get('delete_on_s3',False):
+                                    self.store.delete(name, r)
+                                    r = None
+                                self.baseline[name] = {'local':None, 'remote':r}
+                                continue
+                            if action == 'download' and not self.cfg.get('sync_from_s3',True):
+                                continue
+                            if action == 'download' and r is None:
+                                if l is not None and self.cfg.get('delete_local',False):
+                                    if self._fingerprint(name) != l:
+                                        raise ValueError('Local change before deletion')
+                                    self._path(name).unlink()
+                                    l = None
+                                self.baseline[name] = {'local':l, 'remote':None}
+                                continue
+                            # Retained deletion tombstone: never resurrect the absent side.
+                            if (old['local'] is None or old['remote'] is None) and (l is None or r is None):
+                                report['conflicts'].append(name + ': deletion retained; manual resolution required')
+                                continue
+                        if action == 'download':
+                            if not self.cfg.get('sync_from_s3',True) or r is None:
+                                continue
+                            l = self._download(name, r, l)
+                        elif l is not None:
+                            if self._fingerprint(name) != l:
+                                raise ValueError('Local change before upload')
+                            # Snapshot first: SDK never streams a file being edited by its owner.
+                            with tempfile.TemporaryFile() as snapshot:
+                                with self._path(name).open('rb') as source:
+                                    for block in iter(lambda:source.read(1024*1024),b''):
+                                        snapshot.write(block)
+                                snapshot.seek(0)
+                                digest = hashlib.sha256()
+                                for block in iter(lambda: snapshot.read(1024*1024), b''):
+                                    digest.update(block)
+                                if digest.hexdigest() != l:
+                                    raise ValueError('Local change during snapshot')
+                                snapshot.seek(0)
+                                r = self.store.upload(name, snapshot, r)
+                        self.baseline[name] = {'local':l, 'remote':r}
+                        report['changed'].append(name)
+                    except Exception as exc:
+                        # Provider/credential-process messages can contain credentials.
+                        report['errors'].append(name + ': ' + type(exc).__name__)
+                atomic_json(self.state_path, {'version':1, 'files':self.baseline})
+            except Exception as exc:
+                report['errors'].append(type(exc).__name__)
+            self.last_report = report
+            for issue in report['conflicts'] + report['errors']:
+                logging.warning('%s', issue)
+            return report
+
+    def start(self):
+        with self._condition:
+            if self._worker is None:
+                self._worker = threading.Thread(target=self._run, name='sync-worker', daemon=False)
+                self._worker.start()
+        self.request_sync('startup', immediate=True)
+
+    def request_sync(self, reason='event', immediate=False):
+        with self._condition:
+            if self._stop.is_set():
+                return False
+            due = time.monotonic() + (0 if immediate else self.cfg.get('debounce_secs',5))
+            if immediate:
+                self._due = due if self._due is None else min(self._due, due)
+                self._immediate_pending = True
+            elif not self._immediate_pending:
+                self._due = due
+            self._condition.notify_all()
+            return True
+
+    def _run(self):
+        next_poll = time.monotonic() + self.cfg.get('poll_interval',30)
+        while not self._stop.is_set():
+            with self._condition:
+                now = time.monotonic()
+                if now >= next_poll:
+                    if self._due is None:
+                        self._due = now
+                    next_poll = now + self.cfg.get('poll_interval',30)
+                if self._due is None or self._due > now:
+                    wake = min(next_poll, self._due if self._due is not None else next_poll)
+                    self._condition.wait(max(0,wake-now))
+                    continue
+                self._due = None
+                self._immediate_pending = False
+            self.sync()
+
+    def stop(self, timeout=30):
+        self._stop.set()
+        with self._condition:
+            self._condition.notify_all()
+        if self._worker and self._worker is not threading.current_thread():
+            self._worker.join(timeout)
+        return not self._worker or not self._worker.is_alive()
 
 
-# ── Push (Local → S3) ────────────────────────────────────────────
-def sync_to_s3(reason: str = "auto"):
-    global last_sync, sync_status
+# Lazy compatibility facade for the tray. Both old direction buttons request
+# the SAME reconciliation worker; no second push/pull loop exists.
+cfg = {}
+engine = None
+observer = None
+tray_ref = None
+sync_status = 'Idle'
 
-    with sync_lock:
-        now = time.time()
-        if now - last_sync < cfg.get("debounce_secs", 5):
-            return
-        last_sync = now
+def request_sync(reason='manual', immediate=True):
+    return engine.request_sync(reason, immediate) if engine else False
 
-    sync_status = "Pushing to S3..."
-    update_tray()
+sync_to_s3 = request_sync
+sync_from_s3 = request_sync
 
-    ws    = cfg["workstation_id"]
-    cmd   = _build_push_cmd()
-    max_r = cfg.get("max_retries", 3)
-    no_retry = (
-        "invalidclienttokenid", "signaturedoesnotmatch",
-        "nosuchbucket", "accessdenied"
-    )
-
-    for attempt in range(1, max_r + 1):
-        logging.info(f"[PUSH/{reason}] Attempt {attempt}/{max_r}")
-        res = subprocess.run(cmd, capture_output=True, text=True)
-
-        if res.returncode == 0:
-            ts = datetime.now().strftime("%H:%M:%S")
-            sync_status = f"OK  {ts}"
-            logging.info("Push completed.")
-            desktop_notify("HTE Sync — Pushed",
-                           f"[{ws}] Local to S3 complete")
-            update_tray()
-            return
-
-        err = res.stderr.lower()
-        logging.error(f"Push failed {attempt}: {res.stderr}")
-
-        if any(k in err for k in no_retry):
-            sync_status = "Auth/Config Error"
-            desktop_notify("HTE Sync Error",
-                           f"[{ws}] Auth error — reconfigure")
-            update_tray()
-            return
-
-        if attempt < max_r:
-            time.sleep(30)
-
-    sync_status = "Push Failed"
-    desktop_notify("HTE Sync Failed",
-                   f"[{ws}] Push failed after {max_r} attempts")
-    update_tray()
-
-
-# ── Pull (S3 → Local) ────────────────────────────────────────────
-def sync_from_s3(reason: str = "poll"):
-    global sync_status
-
-    ws  = cfg["workstation_id"]
-    cmd = _build_pull_cmd()
-
-    if reason != "poll":
-        sync_status = "Pulling from S3..."
-        update_tray()
-
-    logging.info(f"[PULL/{reason}] S3 to local starting")
-    result = subprocess.run(cmd, capture_output=True, text=True)
-
-    if result.returncode == 0:
-        output = result.stdout.strip()
-        if output:
-            logging.info(f"S3 to Local changes:\n{output}")
-            deleted = [
-                l for l in output.splitlines()
-                if "delete:" in l.lower()
-            ]
-            if deleted and reason != "poll":
-                desktop_notify(
-                    "HTE Sync — Pulled",
-                    f"[{ws}] {len(deleted)} file(s) removed"
-                )
-        else:
-            logging.info("S3 to Local: no changes")
-
-        if reason != "poll":
-            ts = datetime.now().strftime("%H:%M:%S")
-            sync_status = f"OK  {ts}"
-            update_tray()
-    else:
-        err = result.stderr.lower()
-        logging.error(f"S3 to Local failed: {result.stderr}")
-        if any(k in err for k in (
-            "nosuchbucket", "accessdenied", "invalidclienttokenid"
-        )):
-            desktop_notify("HTE Sync Error",
-                           "S3 pull error — check credentials")
-        if reason != "poll":
-            sync_status = "Pull Failed"
-            update_tray()
-
-
-# ── S3 Poller ────────────────────────────────────────────────────
-def start_s3_poller():
-    global poll_running
-    interval     = cfg.get("poll_interval", 30)
-    poll_running = True
-    logging.info(f"S3 poller started — every {interval}s")
-    while poll_running:
-        time.sleep(interval)
-        if not poll_running:
-            break
-        if cfg.get("sync_from_s3", True):
-            threading.Thread(
-                target=sync_from_s3,
-                args=("poll",), daemon=True
-            ).start()
-    logging.info("S3 poller stopped.")
-
+def stop(timeout=30):
+    return engine.stop(timeout) if engine else True
 
 def stop_s3_poller():
-    global poll_running
-    poll_running = False
+    return stop()
+
+def make_icon(color=(34,197,94)):
+    from PIL import Image, ImageDraw
+    image = Image.new('RGBA',(64,64),(0,0,0,0))
+    ImageDraw.Draw(image).ellipse((3,3,61,61),fill=color)
+    return image
+
+def desktop_notify(title, message):
+    if cfg.get('notifications',True):
+        try:
+            from plyer import notification
+            notification.notify(title=title,message=message,app_name='Sync Agent',timeout=4)
+        except Exception:
+            logging.debug('Notification unavailable',exc_info=True)
