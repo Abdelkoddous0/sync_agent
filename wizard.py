@@ -7,6 +7,7 @@ import subprocess
 
 import config
 from helpers import ask, ask_int, banner, confirm, err, info, ok, save_credentials, verify_aws
+from ui import menu, section, settings_table, step, warn, working
 
 
 def ensure_aws_cli(**kwargs):
@@ -14,9 +15,17 @@ def ensure_aws_cli(**kwargs):
     return ensure(**kwargs)
 
 
+def default_workstation_id():
+    """Suggest the computer name, reduced to the allowed workstation ID characters."""
+    import socket
+    name = os.environ.get('COMPUTERNAME') or socket.gethostname() or 'workstation'
+    return re.sub(r'[^A-Za-z0-9_-]+', '-', name).strip('-')[:64] or 'workstation'
+
+
 def edit_identity(cfg):
     while True:
-        value = ask('Workstation ID (letters, digits, underscore, hyphen)', cfg.get('workstation_id',''))
+        value = ask('Workstation ID (letters, digits, underscore, hyphen)',
+                    cfg.get('workstation_id') or default_workstation_id())
         if re.fullmatch(r'[A-Za-z0-9_-]{1,64}',value):
             cfg['workstation_id'] = value
             return
@@ -43,9 +52,11 @@ def edit_credentials(cfg):
     choices = {'1':'access_keys','2':'sso','3':'roles_anywhere','4':'workload_role','5':'profile'}
     current = cfg.get('auth_method','access_keys')
     default = next((key for key,value in choices.items() if value == current),'1')
-    info('1 Access keys (dedicated profile)   2 Browser SSO (configured profile)')
-    info('3 Roles Anywhere (configured certificate-helper profile)')
-    info('4 AWS workload/default SDK credential chain   5 Other existing AWS profile')
+    menu([('1', 'Access keys', 'dedicated sync-agent profile'),
+          ('2', 'Browser SSO', 'existing IAM Identity Center profile'),
+          ('3', 'Roles Anywhere', 'existing certificate-helper profile'),
+          ('4', 'Workload / default chain', 'standard SDK credential chain'),
+          ('5', 'Other AWS profile', 'existing trusted profile')], title='How should Sync Agent sign in to AWS?')
     while True:
         choice = ask('Authentication method',default)
         if choice in choices:
@@ -58,17 +69,17 @@ def edit_credentials(cfg):
         return _edit_access_credentials(cfg)
     if method == 'workload_role':
         cfg['aws_profile'] = None
-        info('Uses the standard SDK credential chain, NOT a guarantee of role-only credentials.')
-        info('Environment variables and default profiles can take precedence over workload roles.')
+        warn('Uses the standard SDK credential chain, NOT a guarantee of role-only credentials.')
+        warn('Environment variables and default profiles can take precedence over workload roles.')
     else:
         if method == 'sso':
             info('First provision a profile using: aws configure sso --profile YOUR_PROFILE')
             info('This step only selects it. Browser sign-in is offered after saving.')
         elif method == 'roles_anywhere':
             info('Your administrator must provision a trusted AWS signing helper and certificate profile.')
-            info('The selected credential_process may execute a local program when credentials are requested.')
+            warn('The selected credential_process may execute a local program when credentials are requested.')
         else:
-            info('Select a trusted preconfigured AWS profile; its credential process may execute local programs.')
+            warn('Select a trusted preconfigured AWS profile; its credential process may execute local programs.')
         cfg['aws_profile'] = ask('Existing AWS profile name',cfg.get('aws_profile') or config.AWS_PROFILE)
     validate_auth_profile(cfg)
     info('No AWS profile files changed. Identity verification is offered only after saving.')
@@ -108,7 +119,7 @@ def edit_options(cfg):
     cfg['transfer_timeout'] = ask_int('Transfer socket timeout seconds',cfg.get('transfer_timeout',120),10,3600)
     cfg['sync_from_s3'] = confirm('Download new/changed S3 objects?',cfg.get('sync_from_s3',True))
     cfg['recursive'] = confirm('Include subfolders?',cfg.get('recursive',True))
-    info('Deletion propagation is OFF by default. Enable only after backing up and testing.')
+    warn('Deletion propagation is OFF by default. Enable only after backing up and testing.')
     cfg['delete_on_s3'] = confirm('Propagate baseline-confirmed local deletions to S3?',cfg.get('delete_on_s3',False))
     cfg['delete_local'] = confirm('Propagate baseline-confirmed remote deletions locally?',cfg.get('delete_local',False))
     defaults = cfg.get('exclude_patterns',['*.tmp','*.part','~$*','desktop.ini','Thumbs.db'])
@@ -118,9 +129,13 @@ def edit_options(cfg):
 
 def collect_settings(existing=None):
     cfg = dict(existing or {})
+    step(1, 4, 'Identity', 'Name this computer; it becomes part of the default S3 prefix.')
     edit_identity(cfg)
+    step(2, 4, 'AWS sign-in', 'Choose a region and how credentials are obtained.')
     credentials = edit_credentials(cfg)
+    step(3, 4, 'Folders', 'Pick the local folder and the S3 bucket/prefix it mirrors.')
     edit_paths(cfg)
+    step(4, 4, 'Sync options', 'Press Enter to keep the safe defaults shown in parentheses.')
     edit_options(cfg)
     return config.validate_config(cfg), credentials
 
@@ -186,7 +201,10 @@ def _apply_settings_locked(checked, credentials):
 
 
 def finish_settings(cfg, credentials):
-    print(json.dumps(cfg,indent=2))
+    section('Review')
+    settings_table(cfg, 'Settings to save')
+    if credentials:
+        info('New AWS access keys will be written to the sync-agent profile.')
     if not confirm('Save these settings? The current agent will stop.',default=False):
         info('Cancelled. Configuration and credentials unchanged; running agent left alone.')
         return False
@@ -203,14 +221,43 @@ def finish_settings(cfg, credentials):
     elif method != 'access_keys':
         verify_now = confirm('Verify AWS identity now? This may contact AWS and execute a configured credential helper.',default=True)
     if verify_now:
-        valid, message = verify_identity(cfg)
-        info(message)
+        with working('Checking AWS identity'):
+            valid, message = verify_identity(cfg)
+        (ok if valid else err)(message)
         if not valid:
-            info('Settings are saved, but the agent was not started. Fix authentication before starting it.')
+            warn('Settings are saved, but the agent was not started. Fix authentication before starting it.')
             return True
     if confirm('Start Sync Agent now?',default=True):
         subprocess.Popen(config.launch_command('--background'),close_fds=True)
-        info('Start requested. Use --status and --logs to confirm runtime health.')
+        ok('Start requested. Sync Agent runs in the system tray.')
+        info('Use --status and --logs to confirm runtime health.')
+    return True
+
+
+def run_import(path, assume_yes=False, start=None):
+    """Apply a prepared settings file (deployment); never writes AWS credentials."""
+    banner('Import prepared settings')
+    try:
+        data = json.loads(Path(path).read_text(encoding='utf-8-sig'))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError(f'Cannot read settings file {path}: {type(exc).__name__}') from None
+    if isinstance(data, dict) and not data.get('workstation_id'):
+        data['workstation_id'] = default_workstation_id()
+    cfg = config.validate_config(data)
+    settings_table(cfg, f'Settings from {Path(path).name}')
+    if not assume_yes and not confirm('Apply these settings? The current agent will stop.', default=False):
+        info('Cancelled. Configuration unchanged; running agent left alone.')
+        return False
+    ensure_aws_cli(interactive=not assume_yes)
+    apply_settings(cfg)
+    ok(f'Settings saved to {config.CONFIG_PATH}.')
+    if cfg.get('auth_method') == 'sso':
+        info('Sign in with SyncAgent.exe --login before the first sync.')
+    if start is None:
+        start = assume_yes or confirm('Start Sync Agent now?', default=True)
+    if start:
+        subprocess.Popen(config.launch_command('--background'), close_fds=True)
+        ok('Start requested. Sync Agent runs in the system tray.')
     return True
 
 

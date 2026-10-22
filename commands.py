@@ -18,23 +18,43 @@ def resource_file(name):
 
 
 def cmd_status():
+    from ui import badge, banner, err, info, key_values, settings_table
+    banner('Status')
     if not config.CONFIG_PATH.exists():
-        print(f'Sync Agent is not configured. Expected: {config.CONFIG_PATH}')
+        info(f'Sync Agent is not configured. Expected: {config.CONFIG_PATH}')
+        info('Run SyncAgent.exe --setup to configure it.')
         return 0
     cfg = config.load_config()
-    print(json.dumps(cfg, indent=2))
     from runtime import is_running
-    print('Agent running:' , 'yes' if is_running() else 'no')
+    running = is_running()
+    rows = [('Agent', badge('RUNNING' if running else 'STOPPED', running)),
+            ('Config', str(config.CONFIG_PATH)), ('Log', cfg['log_file'])]
     status_file = config.DATA_DIR/'status.json'
     if status_file.exists():
         try:
-            print(status_file.read_text(encoding='utf-8'))
-        except OSError:
-            print('Runtime status is currently unavailable.')
+            report = json.loads(status_file.read_text(encoding='utf-8'))
+            healthy = report.get('status') == 'Idle'
+            rows.insert(1, ('Last pass', badge(str(report.get('status', 'unknown')).upper(), healthy)))
+            rows.insert(2, ('Changed', str(len(report.get('changed', [])))))
+            rows.insert(3, ('Conflicts', str(len(report.get('conflicts', [])))))
+            rows.insert(4, ('Errors', str(len(report.get('errors', [])))))
+            report_issues = [*report.get('conflicts', []), *report.get('errors', [])]
+        except (OSError, ValueError, TypeError, AttributeError):
+            report_issues = []
+            rows.append(('Last pass', 'Runtime status is currently unavailable.'))
+    else:
+        report_issues = []
+    key_values(rows)
+    for issue in report_issues[:20]:
+        err(issue)
+    if len(report_issues) > 20:
+        info(f'… {len(report_issues) - 20} more; see --logs.')
+    settings_table(cfg)
     return 0
 
 
 def cmd_logs(follow=False):
+    from ui import info, log_line
     cfg = config.load_config()
     path = Path(cfg['log_file'])
     if not path.is_file():
@@ -46,12 +66,14 @@ def cmd_logs(follow=False):
         handle.seek(max(0,size-65536))
         if size > 65536:
             handle.readline()
-        print(''.join(handle.readlines()[-50:]), end='')
+        for line in handle.readlines()[-50:]:
+            log_line(line)
         if follow:
+            info('Following log output; press Ctrl+C to stop.')
             while True:
                 line = handle.readline()
                 if line:
-                    print(line,end='',flush=True)
+                    log_line(line)
                 else:
                     time.sleep(0.25)
     return 0

@@ -5,7 +5,12 @@ import sys
 
 
 def main(argv=None):
-    parser = argparse.ArgumentParser(prog='SyncAgent', description='Sync Agent — Windows 10/11 S3 synchronization')
+    from ui import VERSION
+    parser = argparse.ArgumentParser(
+        prog='SyncAgent', description='Sync Agent — Windows 10/11 S3 synchronization',
+        epilog='Run without options to start setup (first run) or the tray agent. '
+               'Use --import-config FILE to apply settings prepared by an administrator.')
+    parser.add_argument('--version', action='version', version=f'%(prog)s {VERSION}')
     mode = parser.add_mutually_exclusive_group()
     for name, description in [('setup','Configure Sync Agent'), ('reconfigure','Change selected settings'),
                               ('reconfigure-all','Review all settings'), ('status','Show settings and runtime status'),
@@ -14,6 +19,8 @@ def main(argv=None):
                               ('check-auth','Verify the configured AWS identity (contacts AWS)'),
                               ('uninstall','Open the uninstaller'), ('background','Run without interactive setup')]:
         mode.add_argument('--'+name, action='store_true', help=description)
+    mode.add_argument('--import-config', metavar='FILE', help='Apply a prepared settings JSON file (no credentials)')
+    parser.add_argument('--yes', action='store_true', help='With --import-config: apply and start without prompting')
     parser.add_argument('--follow', action='store_true', help='Follow log output (implies --logs)')
     args = parser.parse_args(argv)
     import config
@@ -45,6 +52,10 @@ def main(argv=None):
             valid, message = verify_identity(cfg)
             print(message)
             return 0 if valid else 1
+        if args.import_config:
+            config.show_console()
+            from wizard import run_import
+            return 0 if run_import(args.import_config, assume_yes=args.yes) else 1
         if args.background and not config.CONFIG_PATH.exists():
             print('Sync Agent has no configuration. Run SyncAgent.exe --setup first.', file=sys.stderr)
             return 1

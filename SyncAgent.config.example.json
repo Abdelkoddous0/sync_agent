@@ -1,0 +1,13 @@
+{
+  "local_path": "C:\\Users\\Public\\Sync Agent Data",
+  "s3_bucket": "example-company-sync",
+  "s3_prefix": "workstations/office",
+  "region": "eu-central-1",
+  "auth_method": "sso",
+  "aws_profile": "company-sso",
+  "sync_from_s3": true,
+  "recursive": true,
+  "delete_on_s3": false,
+  "delete_local": false,
+  "autostart": true
+}

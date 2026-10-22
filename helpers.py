@@ -1,6 +1,5 @@
 """Plain console setup helpers; credentials never appear in process arguments."""
 import configparser
-import getpass
 import io
 import json
 import os
@@ -9,41 +8,7 @@ import subprocess
 import tempfile
 
 from config import APP_NAME, AWS_PROFILE
-
-
-def banner():
-    print('\nSync Agent — Windows 10/11 S3 synchronization\n')
-
-
-def ok(message):
-    print(f'OK: {message}')
-
-
-def err(message):
-    print(f'Error: {message}')
-
-
-def info(message):
-    print(message)
-
-
-def ask(prompt, default='', password=False):
-    if password:
-        return getpass.getpass(f'{prompt}: ').strip()
-    value = input(f'{prompt}' + (f' [{default}]' if default else '') + ': ').strip()
-    return value or default
-
-
-def confirm(prompt, default=True):
-    while True:
-        value = input(f'{prompt} [{"Y/n" if default else "y/N"}]: ').strip().lower()
-        if not value:
-            return default
-        if value in ('y','yes'):
-            return True
-        if value in ('n','no'):
-            return False
-        print('Please enter yes or no.')
+from ui import ask, banner, confirm, err, info, ok, warn, working  # noqa: F401 (re-exported)
 
 
 def ask_int(prompt, default, low, high):
@@ -137,7 +102,8 @@ def verify_aws(ak='', sk='', region='eu-central-1', session_token=''):
                 env['AWS_SESSION_TOKEN'] = session_token
         else:
             command += ['--profile',AWS_PROFILE]
-        result = subprocess.run(command, env=env, capture_output=True, text=True, timeout=30, check=False)
+        with working('Verifying AWS credentials'):
+            result = subprocess.run(command, env=env, capture_output=True, text=True, timeout=30, check=False)
         if result.returncode:
             return False, 'AWS verification failed. Check credentials, session token, region, and connectivity.'
         account = json.loads(result.stdout).get('Account','unknown')

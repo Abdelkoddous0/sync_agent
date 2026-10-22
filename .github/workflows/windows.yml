@@ -34,6 +34,8 @@ jobs:
         run: |
           & .\dist\SyncAgent\SyncAgent.exe --help
           if ($LASTEXITCODE -ne 0) { throw 'Packaged executable smoke test failed' }
+          & .\dist\SyncAgentSetup.exe --help
+          if ($LASTEXITCODE -ne 0) { throw 'Packaged installer smoke test failed' }
           foreach ($file in @('install.ps1', 'uninstall.ps1', 'ensure_aws_cli.ps1')) {
             if (!(Test-Path (Join-Path 'dist\SyncAgent' $file))) { throw "Missing $file" }
           }
@@ -48,3 +50,7 @@ jobs:
         with:
           name: SyncAgent-windows
           path: dist/SyncAgent/
+      - uses: actions/upload-artifact@v4
+        with:
+          name: SyncAgentSetup-windows
+          path: dist/SyncAgentSetup.exe

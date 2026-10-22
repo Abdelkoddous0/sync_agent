@@ -88,6 +88,24 @@ flowchart TB
 
 Both deletion options default to **off**. Download replacement is atomic; conflict handling is not an automatic merge. The chart summarizes path decisions, not every exception/stop branch; eligible baseline updates are saved at the end of the pass.
 
+## Quick install (one file)
+
+`build.bat` also produces **`dist\SyncAgentSetup.exe`**, a single self-contained installer. Copy only that file to the workstation and double-click it (no administrator rights, no Python):
+
+1. It shows the plan (destination, kept settings) and asks once for confirmation.
+2. It installs the embedded bundle with the same safe `install.ps1` (staging, ownership/overlap checks, rollback).
+3. It configures itself: the guided setup wizard opens automatically on a new install; an upgrade keeps existing settings and offers to restart the agent.
+
+```bat
+SyncAgentSetup.exe                         rem interactive install + guided setup
+SyncAgentSetup.exe --config office.json    rem install + apply prepared settings
+SyncAgentSetup.exe --yes                   rem unattended install (configure later)
+SyncAgentSetup.exe --yes --config office.json   rem unattended install + configure + start
+SyncAgentSetup.exe --no-startup            rem never register start at login
+```
+
+**Prepared settings for many workstations:** put a `SyncAgent.config.json` next to `SyncAgentSetup.exe` (or pass `--config`) and it is applied automatically after installation. See [`SyncAgent.config.example.json`](SyncAgent.config.example.json). `workstation_id` may be omitted; the computer name is used. The file never contains credentials: use an SSO, Roles Anywhere, workload or existing profile, or an already provisioned `sync-agent` profile. Settings are fully validated before the running agent is stopped. With `--yes`, a missing AWS CLI is reported rather than installed unattended. Installed agents accept the same file with `SyncAgent.exe --import-config FILE [--yes]`.
+
 ## Start here on Windows
 
 Follow [WINDOWS_SETUP.md](WINDOWS_SETUP.md) for the step-by-step build, installation, authentication and first-test walkthrough. Use [ACCEPTANCE.md](ACCEPTANCE.md) for the packaged Windows tests and live AWS acceptance checklist. Initial testing should leave startup and deletion propagation off.
@@ -104,7 +122,7 @@ build.bat
 
 The build creates `.venv-build`, installs `requirements-dev.txt`, runs the complete pytest suite, and packages only `main.py` using PyInstaller. Any failing step aborts the build. `program.bat` forwards to the same build.
 
-Output: `dist\SyncAgent\SyncAgent.exe`, `_internal`, and the lifecycle scripts. Distribute the entire `dist\SyncAgent` folder, not just the executable. Python is not required on target workstations. This distribution targets 64-bit Windows; Windows ARM64/x86 support has not been established.
+Output: `dist\SyncAgent\SyncAgent.exe`, `_internal`, and the lifecycle scripts, plus the one-file installer `dist\SyncAgentSetup.exe` that embeds that complete folder. Distribute either `SyncAgentSetup.exe` alone or the entire `dist\SyncAgent` folder, not just `SyncAgent.exe`. Python is not required on target workstations. This distribution targets 64-bit Windows; Windows ARM64/x86 support has not been established.
 
 ## Install and AWS CLI detection
 
@@ -271,6 +289,8 @@ SyncAgent.exe --stop                rem cooperative, token-scoped singleton stop
 SyncAgent.exe --reconfigure
 SyncAgent.exe --reconfigure-all
 SyncAgent.exe --uninstall
+SyncAgent.exe --import-config FILE  rem apply prepared settings; add --yes to skip prompts
+SyncAgent.exe --version
 ```
 
 The tray offers Sync now, status, SSO sign-in (when selected), AWS identity check, local folder, logs, reconfiguration, uninstallation and Quit. Maintenance opens a separate console; cancellation does not shut down the agent. Inspect logs for synchronization conflicts and failures; the tray icon is not a detailed health indicator.
@@ -362,6 +382,26 @@ python main.py --help
 python main.py --status
 ```
 
-Tests use temporary directories, fake stores and mocked download/MSI boundaries; never put real credentials in tests. Bootstrap and lifecycle behavior can also be tested with portable PowerShell using `SYNC_AGENT_TEST_PWSH=/absolute/path/to/pwsh`; those runs mock process, network and registry boundaries and do not establish native Windows behavior. Native Windows locks, signatures, MSI execution and frozen GUI behavior still require Windows acceptance tests. The GitHub Actions Windows workflow parses PowerShell, runs the offline suite, builds the bundle, smoke-tests packaged `--help`, and opts into the native packaged install/upgrade/uninstall and junction tests on its disposable Windows runner. A workflow definition is not evidence that the workflow has run successfully. The workflow is manual-only (`workflow_dispatch`) to avoid automatic runner usage: open the repository's Actions tab, select **Windows distribution**, then **Run workflow** when you are ready to consume Actions minutes. Uploading or pushing alone does not trigger it. Windows runner/server testing also does not replace separate Windows 10 and Windows 11 desktop acceptance.
+Tests use temporary directories, fake stores and mocked download/MSI boundaries; never put real credentials in tests. Bootstrap and lifecycle behavior can also be tested with portable PowerShell using `SYNC_AGENT_TEST_PWSH=/absolute/path/to/pwsh`; those runs mock process, network and registry boundaries and do not establish native Windows behavior. Native Windows locks, signatures, MSI execution and frozen GUI behavior still require Windows acceptance tests. The GitHub Actions Windows workflow parses PowerShell, runs the offline suite, builds the bundle and `SyncAgentSetup.exe`, smoke-tests packaged `--help` for both, and opts into the native packaged install/upgrade/uninstall and junction tests on its disposable Windows runner. A workflow definition is not evidence that the workflow has run successfully. The workflow is manual-only (`workflow_dispatch`) to avoid automatic runner usage: open the repository's Actions tab, select **Windows distribution**, then **Run workflow** when you are ready to consume Actions minutes. Uploading or pushing alone does not trigger it. Windows runner/server testing also does not replace separate Windows 10 and Windows 11 desktop acceptance.
 
 Before release, test the full bundle on separate clean Windows 10 and Windows 11 installations: missing/present AWS CLI, declined setup, existing-profile preservation, paths with spaces/non-ASCII, login startup, two-instance rejection, stop during transfer, cancelled reconfiguration/uninstall, successful upgrade and failure rollback, retained user data, and uninstall. Then use disposable AWS objects to verify conflicts, deletion defaults, conditional-write failure and restart behavior before any valuable-data deployment.
+
+### Testing the one-file installer
+
+Get `SyncAgentSetup.exe` either by running `build.bat` on Windows, or from the **SyncAgentSetup-windows** artifact of a manual **Windows distribution** workflow run (`gh workflow run windows.yml --ref <branch>`).
+
+Test on a disposable machine: the installer writes to `%LOCALAPPDATA%` and the current-user Run key. **Windows Sandbox** (Windows 10/11 Pro: *Turn Windows features on or off → Windows Sandbox*) is reset each time it closes; a VM snapshot also works. Copy only `SyncAgentSetup.exe` into it.
+
+| Test | How | Expected |
+|---|---|---|
+| Fresh install | Double-click `SyncAgentSetup.exe` | Plan shown → confirm → installed to `%LOCALAPPDATA%\Programs\SyncAgent` → setup wizard opens |
+| Cancel | Run again and answer **n** | "Installation cancelled; no changes made." |
+| Wizard without AWS changes | Complete the wizard, answer **n** at "Save these settings?" | Review table shown; nothing saved |
+| Status | `"%LOCALAPPDATA%\Programs\SyncAgent\SyncAgent.exe" --status` | Agent state, last pass and settings table |
+| Upgrade | Run `SyncAgentSetup.exe` again after saving settings | "Upgrade existing installation"; settings kept; start offered |
+| Prepared settings | Place an edited copy of `SyncAgent.config.example.json`, renamed `SyncAgent.config.json`, beside the installer and run it | Settings table shown and applied without the wizard |
+| Unattended | `SyncAgentSetup.exe --yes --config SyncAgent.config.json` | No prompts; installs, applies settings and starts the agent |
+| Invalid settings | Use a file with `"s3_bucket": "s3://bad"` | Rejected before the running agent is stopped |
+| Uninstall | `SyncAgent.exe --uninstall` | Application removed; `%LOCALAPPDATA%\SyncAgent` and synced files kept |
+
+Any test that actually synchronizes must use an empty local folder and a disposable S3 bucket/prefix, with both deletion options left **off**.
