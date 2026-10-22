@@ -388,7 +388,7 @@ Run the tests on their own with `python -m pip install -r requirements-dev.txt` 
 | Automated tests | 211 passing on every build |
 | Windows 11 | Packaged install / upgrade / uninstall tests and the 20-check acceptance script pass |
 | Windows 10 | Pending: run [`scripts/acceptance-test.ps1`](scripts/acceptance-test.ps1) (one command) on a Windows 10 PC |
-| Live S3 | Pending: live tests are ready (`tests/test_live_s3.py`, `tests/test_live_e2e.py`) and need a valid test key |
+| Live S3 | Passed on 2026-10-22 against a test bucket in eu-central-1: conditional operations and full end-to-end sync, test objects cleaned up |
 | Code signing | Built into `build.bat` and CI, verified with a test certificate; needs a real certificate ([how](docs/development.md#code-signing)) |
 
 Run the pending checks with disposable resources before syncing valuable data: see [docs/testing.md](docs/testing.md).

@@ -31,13 +31,13 @@ PowerShell lifecycle tests run the real `scripts\*.ps1` with process, network an
 
 | Level | Result |
 | --- | --- |
-| Offline suite | **211 passed**, 6 skipped (opt-in live and native tests, symlink privilege), 21 subtests passed |
+| Offline suite | **217 passed**, 6 skipped (opt-in live and native tests, symlink privilege), 21 subtests passed |
 | Native packaged tests (`tests/test_native_bundle.py`) | **2 passed**: frozen install, upgrade, uninstall, Start Menu shortcut, Installed apps entry, junction rejection |
 | One-command acceptance (`scripts\acceptance-test.ps1`) | **20 / 20 checks passed** on Windows 11, with an existing Sync Agent installation on the same account restored byte-for-byte |
 | Code signing pipeline | Verified with a temporary self-signed certificate: both executables signed (SHA-256), timestamped, and still run correctly |
 | Manual | Tray actions, the confirmation dialog and keyboard focus exercised; the background agent ran and stopped cleanly |
 | **Windows 10** | **Pending**: run `acceptance-test.ps1` on a Windows 10 PC |
-| **Live S3** (`test_live_s3.py`, `test_live_e2e.py`) | **Pending**: blocked on the test PC. AWS rejected the configured access key (`InvalidAccessKeyId`), and the PC clock was 2 h behind. No object was written. The end-to-end test logic passes against the offline fake store. |
+| Live S3 (`test_live_s3.py`, `test_live_e2e.py`) | **2 passed** against a disposable bucket in eu-central-1 (access-key profile): conditional create/update/download/delete with stale-ETag rejection, and full end-to-end sync (first-sync conflict, both-direction edits, both-sides conflict, deletion default, restart). No test object left behind. |
 | **Real code-signing certificate** | **Pending**: requires a certificate issued to the publisher (see [development.md](development.md#code-signing)) |
 | Not covered | AWS CLI download/MSI, real SSO and Roles Anywhere sessions |
 
