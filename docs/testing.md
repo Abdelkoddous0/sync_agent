@@ -1,22 +1,42 @@
-# Windows and AWS release acceptance
+# Testing Sync Agent
 
-Status: these are executable opt-in tests and a remaining manual checklist, NOT evidence of a native Windows or live AWS pass. Offline tests can run on Linux. No real AWS credentials, bucket or Windows execution target were supplied to the repair session. Do not publish a release-validation claim based only on source or mocked tests.
+There are three levels of testing, from safest to most realistic:
 
-## Latest executed offline verification — 2026-10-22
-
-From the source root on Linux:
-
-```sh
-SYNC_AGENT_TEST_PWSH=/home/legeant/.hermes/cache/scratch/sync-agent-pwsh/bin/pwsh PYTHONDONTWRITEBYTECODE=1 python -m pytest tests -q -rs --tb=short
+```mermaid
+flowchart LR
+    accTitle: Test levels
+    accDescr: Offline tests need no AWS and no installation. Native packaged tests install the real build into temporary folders. Live tests use a disposable S3 bucket.
+    A["1. Offline suite<br/>pytest, ~30 s<br/>no AWS, no install"] --> B["2. Native packaged tests<br/>real install → upgrade → uninstall<br/>disposable Windows account"]
+    B --> C["3. Live S3 + manual checklist<br/>disposable bucket<br/>Windows 10 and 11"]
+    classDef work fill:#dbeafe,stroke:#1d4ed8,color:#172554
+    class A,B,C work
 ```
 
-Result: **165 passed, 3 skipped, 21 subtests passed in 17.60s**, exit 0. The skipped tests are the live S3 test and two native Windows bundle tests. The PowerShell path above is specific to the repair host; it is not a Windows installation prerequisite.
+Passing tests at one level is not evidence for the next: mocked tests do not prove native Windows behaviour, and native tests do not prove S3 permissions or real syncing.
 
-Also executed successfully: AST parsing of 34 Python source/test files, `python main.py --help`, isolated unconfigured `--status`, and portable-PowerShell parsing of `ensure_aws_cli.ps1`, `install.ps1` and `uninstall.ps1`. Authentication coverage includes real saved SSO settings through CLI dispatch into the backend, local profile parsing without credential/helper execution, mocked explicit CLI login and offline SDK STS responses. Provider failures are checked for secret leakage at debug log level. These checks do not establish actual browser sign-in, signing-helper operation, native packaging/MSI behavior or AWS permissions.
+## 0. Offline suite (any developer machine)
+
+From the repository root (tests import from `src/` via `pyproject.toml`):
+
+```bat
+python -m pip install -r requirements-dev.txt
+python -m pytest
+```
+
+`build.bat` runs the same suite and stops the build on any failure. Expected result: everything passes. Five tests are skipped unless explicitly enabled: the live S3 test, two native bundle tests, and tests needing symlink privileges.
+
+PowerShell lifecycle tests run the real `scripts\*.ps1` with process, network and registry calls mocked. They use Windows PowerShell 5.1 on Windows, or `SYNC_AGENT_TEST_PWSH=/path/to/pwsh` elsewhere.
+
+### Latest recorded run — 2026-10-22, Windows 11 Home (10.0.26200), Python 3.11, Windows PowerShell 5.1
+
+- Offline suite: **192 passed, 5 skipped, 21 subtests passed**.
+- Native packaged tests (`tests/test_native_bundle.py` against a freshly built `dist\SyncAgent`): **2 passed**. These covered the frozen install, upgrade, uninstall, Start Menu shortcut, Installed apps entry and junction rejection.
+- Manual: the one-file installer ran unattended into a temporary profile; the background agent ran against a dead local endpoint and stopped cleanly; tray actions and the confirmation dialog were exercised.
+- Not run: Windows 10, live S3, AWS CLI download/MSI, real SSO or Roles Anywhere.
 
 ## 1. Native packaged tests (disposable Windows account/VM only)
 
-Use separate clean 64-bit Windows 10 and Windows 11 VMs. A GitHub-hosted Windows runner is useful supplemental coverage but is not either desktop OS certification. Do not run the native test in an account with a real Sync Agent installation/startup entry. It refuses an existing `SyncAgent` Run value, uses a temporary LOCALAPPDATA with spaces/non-ASCII, and briefly registers current-user startup. It does not start a sync worker, download AWS CLI or contact AWS.
+Use separate clean 64-bit Windows 10 and Windows 11 VMs. A GitHub-hosted Windows runner is useful supplemental coverage but is not either desktop OS certification. Do not run the native test in an account with a real Sync Agent installation/startup entry. It refuses an existing `SyncAgent` Run value or Installed-apps entry, uses a temporary LOCALAPPDATA with spaces/non-ASCII and a temporary APPDATA for the Start Menu shortcut, and briefly registers current-user startup and the Installed-apps entry. It does not start a sync worker, download AWS CLI or contact AWS.
 
 Build from the source root in cmd:
 

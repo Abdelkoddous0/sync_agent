@@ -1,407 +1,385 @@
-# Sync Agent
+<p align="center">
+  <img src="docs/images/icon.png" alt="" width="96" height="96">
+</p>
 
-Windows 10/11 desktop tray application for conservative file synchronization with an AWS S3 bucket prefix. The executable is `SyncAgent.exe`. It runs as the signed-in user, not as a Windows service.
+<h1 align="center">Sync Agent</h1>
 
-## How Sync Agent fits together
+<p align="center">
+  Keep a Windows folder in sync with an Amazon S3 bucket, safely.<br>
+  Windows 10 / 11 · runs in the system tray · no administrator rights needed
+</p>
 
-One Windows tray app, one reconciliation worker, one configured S3 prefix. The arrows below show actual file/state access; the AWS CLI is **not** the transfer engine.
+<p align="center">
+  <a href="#quick-start">Quick start</a> ·
+  <a href="#setting-it-up">Setup</a> ·
+  <a href="#configuration-settings">Settings</a> ·
+  <a href="#everyday-use">Everyday use</a> ·
+  <a href="#how-syncing-works">How it works</a> ·
+  <a href="docs/troubleshooting.md">Troubleshooting</a>
+</p>
 
-```mermaid
-flowchart TB
-    accTitle: Sync Agent architecture
-    accDescr: Windows events, polling and manual requests feed one worker. The worker accesses local files and a persistent baseline and uses boto3 to access one S3 prefix.
-    subgraph PC["Windows 10 / 11"]
-        Events["Local file events"] --> Queue["Debounce + request scheduling"]
-        Poll["Periodic remote poll"] --> Queue
-        Tray["Tray: Sync now"] --> Queue
-        Queue --> Worker["One reconciliation worker"]
-        Files[("Local sync folder")] <--> Worker
-        Baseline[("Persistent baseline")] <--> Worker
-        Worker --> Report["Status + rotating logs"]
-        Worker <--> SDK["boto3 / botocore"]
-    end
-    SDK <-->|"Scoped S3 operations"| S3[("AWS S3<br/>Configured bucket / prefix")]
-    classDef process fill:#dbeafe,stroke:#1d4ed8,color:#172554
-    classDef data fill:#f1f5f9,stroke:#64748b,color:#0f172a
-    class Queue,Worker,SDK process
-    class Files,Baseline,S3 data
-```
+---
 
-**Reading the diagrams:** arrows show the flow; diamonds are decisions. Blue boxes perform work, green boxes are completed outcomes, amber boxes need a decision/review, and red boxes stop or skip an unsafe action. Labels explain the meaning without relying on color.
+Sync Agent watches a local folder and an S3 "folder" (a bucket prefix) and copies new and changed files in both directions. It is deliberately **conservative**: it never picks a winner by timestamp, never overwrites a file that changed on both sides, and does not delete anything unless you turn deletion on.
 
-**Jump to:** [First installation](#installation-and-first-run) · [Authentication](#choose-an-authentication-method) · [Sync decisions](#how-a-sync-pass-decides) · [Reconfiguration](#reconfiguration-without-interrupting-on-cancel) · [Uninstall](#what-uninstall-removes-and-keeps)
+- **One-file installer.** Double-click `SyncAgentSetup.exe`; a guided setup asks a few questions and starts syncing.
+- **Lives in the tray.** No console window; the icon shows when it is syncing (amber dot) or needs attention (red dot).
+- **Safe by design.** Conditional S3 writes, atomic downloads, conflict detection, deletions off by default, and no process killing.
+- **Flexible sign-in.** Access keys, company SSO (IAM Identity Center), Roles Anywhere, existing AWS profiles or the AWS workload chain.
+- **Easy to deploy.** Ship one prepared settings file next to the installer to set up many computers without questions.
 
-## Safety and validation status
+<p align="center">
+  <img src="docs/images/tray-states.png" alt="Tray icon states: up to date, syncing (amber dot), needs attention (red dot)" width="520">
+</p>
 
-Use a disposable local folder and a non-production S3 prefix for initial Windows testing. This repair has offline regression coverage; a passing Linux test run or PowerShell parse does not establish that native Windows installation, the packaged executable, or live S3 integration works. Native Windows 10 and Windows 11 acceptance testing remains required. No production AWS calls are necessary to run the tests.
+## Contents
 
-- Files present only locally are uploaded, not removed to match S3.
-- Local and remote deletion propagation are both disabled by default.
-- A persistent baseline records prior file hashes and S3 ETags. Deletions observed with propagation disabled are remembered, preventing an automatic upload/download from resurrecting the deleted side.
-- If both sides changed or a path cannot be mapped safely, the application preserves both originals and reports a conflict. It does not automatically merge or create a resolution copy.
-- On first synchronization, an existing path on both sides is treated conservatively as a conflict because there is no shared baseline, even if the contents might be identical.
-- Downloads use temporary files and recheck local content before atomic replacement. S3 writes use conditional requests. Failed conditions are reported rather than retried as unconditional overwrites.
-- One worker serializes synchronization; events arriving during a transfer remain pending. Directory changes also enqueue reconciliation.
-- Windows reserved names, traversal, case/Unicode aliases, links and reparse points are rejected. These checks reduce risk but are not an OS sandbox against a malicious process that can concurrently rewrite the same filesystem tree.
-- Uploads larger than 5 GiB are refused; conditional multipart uploads are not implemented. Empty directories and metadata/ACL mirroring are not supported.
-- Enable S3 bucket versioning and maintain independent backups. Synchronization is not a backup service.
+- [Quick start](#quick-start)
+- [Setting it up](#setting-it-up)
+- [Configuration settings](#configuration-settings)
+- [Everyday use](#everyday-use)
+- [How syncing works](#how-syncing-works)
+- [Installing on other computers](#installing-on-other-computers)
+- [Uninstalling](#uninstalling)
+- [Building from source](#building-from-source)
+- [Project structure](#project-structure)
+- [Documentation](#documentation)
 
-Do not manually delete or edit the baseline to resolve conflicts: removing it changes first-sync/deletion semantics and can resurrect previously deleted data. Stop the agent, preserve copies of both sides, and resolve conflicts deliberately. Changing the local folder, bucket, prefix, profile or non-key authentication method creates a separate baseline identity. Access-key mode retains the prior profile-bound identity for compatibility; switching to a non-key method refuses an existing older identity until migration is reviewed, rather than silently dropping tombstones. Pre-release baselines that lack profile identity require explicit review/migration; the agent refuses to silently discard their tombstones and begin first sync.
+## Quick start
 
-### How a sync pass decides
+**You need:** a 64-bit Windows 10 or 11 PC, an existing S3 bucket, and AWS credentials allowed to use it ([minimum permissions](docs/authentication.md#minimum-aws-permissions)).
 
-This is a per-path overview, not a timestamp-based winner selection. A baseline is the last recorded local hash / remote ETag pair, including retained deletions.
+1. **Get the installer.** Build `dist\SyncAgentSetup.exe` with [`build.bat`](#building-from-source), or download the **SyncAgentSetup-windows** artifact from the repository's *Windows distribution* workflow.
+2. **Run it.** Double-click `SyncAgentSetup.exe` and confirm. If Windows shows *"Windows protected your PC"*, click **More info → Run anyway** (the program is not code-signed).
+3. **Answer the setup questions** ([explained below](#setting-it-up)). Defaults are pre-filled; press **Enter** to accept them.
+4. **Start it.** Answer **Y** to *Start Sync Agent now?*. The tray icon appears; it may be under the **^** arrow.
 
-```mermaid
-flowchart TB
-    accTitle: Conservative per-path synchronization decisions
-    accDescr: Unsafe paths are skipped. Without a baseline, paths present on both sides conflict. With a baseline, unchanged paths are skipped, both-side changes conflict, and one-side changes follow guarded transfer or deletion rules.
-    Scan["Scan local files + list S3 prefix"] --> Safe{"Safe path?"}
-    Safe -->|"No"| Reject["Skip path + report conflict"]
-    Safe -->|"Yes"| Known{"Baseline?"}
-    Known -->|"No"| Both{"Both exist?"}
-    Both -->|"Yes"| Conflict["Preserve originals<br/>Report conflict for manual review"]
-    Both -->|"No"| Rules["Apply guarded transfer / deletion rules"]
-    Known -->|"Yes"| Changes{"Changed?"}
-    Changes -->|"Neither side"| Skip["No file operation"]
-    Changes -->|"Both; file remains"| Conflict
-    Changes -->|"Both now absent"| Absent["Record both absent<br/>No file operation"]
-    Changes -->|"One side"| Rules
-    Rules --> Save["Persist baseline + pass report"]
-    classDef process fill:#dbeafe,stroke:#1d4ed8,color:#172554
-    classDef decision fill:#fef3c7,stroke:#b45309,color:#78350f
-    classDef stop fill:#fee2e2,stroke:#b91c1c,color:#7f1d1d
-    classDef done fill:#dcfce7,stroke:#15803d,color:#14532d
-    class Scan,Rules,Save process
-    class Safe,Known,Both,Changes decision
-    class Reject,Conflict stop
-    class Skip,Absent done
-```
-
-| Guarded action | What must be true | If the guard fails |
-| --- | --- | --- |
-| Upload a new/changed local file | Stable local snapshot; conditional S3 write succeeds | Report error; no unconditional overwrite fallback |
-| Download a new/changed S3 object | Downloads enabled; no retained-deletion conflict; remote/local checks pass | Skip, report conflict or report error; do not blindly replace local data |
-| Propagate a local deletion to S3 | Baseline-confirmed deletion; `delete_on_s3=true`; conditional S3 delete succeeds | Preserve remote object; disabled deletions remain recorded |
-| Propagate a remote deletion locally | Baseline-confirmed deletion; downloads enabled; `delete_local=true`; local file still matches | Preserve local file; do not delete a newly edited file |
-| Revisit a retained one-sided deletion | No automatic resurrection is allowed by the retained-deletion rule | Report conflict when a transfer would resurrect the absent side |
-
-Both deletion options default to **off**. Download replacement is atomic; conflict handling is not an automatic merge. The chart summarizes path decisions, not every exception/stop branch; eligible baseline updates are saved at the end of the pass.
-
-## Quick install (one file)
-
-`build.bat` also produces **`dist\SyncAgentSetup.exe`**, a single self-contained installer. Copy only that file to the workstation and double-click it (no administrator rights, no Python):
-
-1. It shows the plan (destination, kept settings) and asks once for confirmation.
-2. It installs the embedded bundle with the same safe `install.ps1` (staging, ownership/overlap checks, rollback).
-3. It configures itself: the guided setup wizard opens automatically on a new install; an upgrade keeps existing settings and offers to restart the agent.
-
-```bat
-SyncAgentSetup.exe                         rem interactive install + guided setup
-SyncAgentSetup.exe --config office.json    rem install + apply prepared settings
-SyncAgentSetup.exe --yes                   rem unattended install (configure later)
-SyncAgentSetup.exe --yes --config office.json   rem unattended install + configure + start
-SyncAgentSetup.exe --no-startup            rem never register start at login
-```
-
-**Prepared settings for many workstations:** put a `SyncAgent.config.json` next to `SyncAgentSetup.exe` (or pass `--config`) and it is applied automatically after installation. See [`SyncAgent.config.example.json`](SyncAgent.config.example.json). `workstation_id` may be omitted; the computer name is used. The file never contains credentials: use an SSO, Roles Anywhere, workload or existing profile, or an already provisioned `sync-agent` profile. Settings are fully validated before the running agent is stopped. With `--yes`, a missing AWS CLI is reported rather than installed unattended. Installed agents accept the same file with `SyncAgent.exe --import-config FILE [--yes]`.
-
-## Start here on Windows
-
-Follow [WINDOWS_SETUP.md](WINDOWS_SETUP.md) for the step-by-step build, installation, authentication and first-test walkthrough. Use [ACCEPTANCE.md](ACCEPTANCE.md) for the packaged Windows tests and live AWS acceptance checklist. Initial testing should leave startup and deletion propagation off.
-
-The repository contains source and build instructions, not a Windows executable built or validated in this Linux repair session.
-
-## Build on Windows
-
-Install a supported 64-bit Python version (Python 3.12 is the Windows CI target), then run:
-
-```bat
-build.bat
-```
-
-The build creates `.venv-build`, installs `requirements-dev.txt`, runs the complete pytest suite, and packages only `main.py` using PyInstaller. Any failing step aborts the build. `program.bat` forwards to the same build.
-
-Output: `dist\SyncAgent\SyncAgent.exe`, `_internal`, and the lifecycle scripts, plus the one-file installer `dist\SyncAgentSetup.exe` that embeds that complete folder. Distribute either `SyncAgentSetup.exe` alone or the entire `dist\SyncAgent` folder, not just `SyncAgent.exe`. Python is not required on target workstations. This distribution targets 64-bit Windows; Windows ARM64/x86 support has not been established.
-
-## Install and AWS CLI detection
-
-On the target Windows 10/11 machine, run `install.bat` from the full bundle, or from the source directory after building. Run it as the normal user.
-
-```bat
-install.bat
-```
-
-Default locations:
-
-```text
-%LOCALAPPDATA%\Programs\SyncAgent\    application bundle
-%LOCALAPPDATA%\SyncAgent\config.json settings (no AWS secret keys)
-%LOCALAPPDATA%\SyncAgent\logs\       rotating logs
-%LOCALAPPDATA%\SyncAgent\baseline-*.json reconciliation baselines
-```
-
-Installation requests confirmation, stages the bundle, checks its diagnostic entry point, requests a cooperative stop of the previous agent, and replaces the application with rollback on failure. It registers current-user startup under `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`. There are no scheduled tasks, Defender exclusions, system PATH changes, force-killed application processes, or automatic removal of older differently named products.
-
-The installer/uninstaller refuse unrecognized existing application folders (ownership requires `SyncAgent.install.json` and the expected executable), configured sync-folder overlap, and unreadable settings that prevent checking overlap. Do not add an ownership marker to an unrelated directory to bypass this protection. Filesystem rollback is attempted even if restoring startup registration fails; reported registry errors may require manual repair. Startup commands exceeding the 260-character Run-key limit are rejected; `-NoStartup` avoids startup registration.
-
-Installer switches:
-
-```bat
-install.bat -NoStartup
-install.bat -SourceDir "C:\Downloads\SyncAgent"
-```
-
-`-Yes` bypasses the installation confirmation; do not use it without reviewing the destination and source. Installation itself does not configure credentials or access S3. Start setup explicitly afterward:
-
-```bat
-"%LOCALAPPDATA%\Programs\SyncAgent\SyncAgent.exe" --setup
-```
-
-At interactive setup and normal interactive startup, the application probes AWS CLI with a bounded `aws --version` check. If absent, it asks for approval to download and install the official current-user AWS CLI MSI. The bootstrap verifies Authenticode validity and the Amazon publisher, checks MSI exit status, then probes the installed CLI again. Cancelling the download does not silently install anything. Noninteractive/background startup fails clearly if AWS CLI is missing; it never opens an unattended installer. Diagnostics (`--status`, `--logs`, `--stop`, `--help`) do not bootstrap AWS CLI.
-
-The sync engine uses boto3, not opposing `aws s3 sync --delete` commands. AWS CLI remains a checked prerequisite to satisfy the deployment requirement.
-
-### Installation and first run
-
-Recommended first test: keep the entire bundle together, install without startup, and use disposable data. Installation and AWS setup are separate steps.
-
-```mermaid
-flowchart TB
-    accTitle: First installation and interactive AWS CLI setup
-    accDescr: Build the full Windows bundle, install without startup, and launch setup. A missing AWS CLI requires approval and a verified MSI before setup can continue.
-    Build["build.bat on Windows<br/>Keep ALL of dist/SyncAgent"] --> Install["install.bat -NoStartup"]
-    Install --> Setup["SyncAgent.exe --setup"]
-    Setup --> CLI{"CLI ready?"}
-    CLI -->|"Yes"| Wizard["Choose auth + folder + S3 prefix<br/>Review options; deletions OFF"]
-    CLI -->|"No"| Approve{"Install CLI?"}
-    Approve -->|"No"| Stop["Stop setup<br/>No unattended CLI installation"]
-    Approve -->|"Yes"| Verify["Download MSI; verify signature + publisher<br/>Install; check CLI again"]
-    Verify -->|"Successful"| Wizard
-    Verify -->|"Failed"| Stop
-    Wizard --> Confirm{"Save?"}
-    Confirm -->|"No"| Cancel["Cancel without saving settings"]
-    Confirm -->|"Yes"| Ready["Settings saved<br/>Auth checks + start offered next"]
-    classDef process fill:#dbeafe,stroke:#1d4ed8,color:#172554
-    classDef decision fill:#fef3c7,stroke:#b45309,color:#78350f
-    classDef stop fill:#fee2e2,stroke:#b91c1c,color:#7f1d1d
-    classDef done fill:#dcfce7,stroke:#15803d,color:#14532d
-    class Build,Install,Setup,Wizard,Verify process
-    class CLI,Approve,Confirm decision
-    class Stop,Cancel stop
-    class Ready done
-```
-
-Declining the final settings save does not undo an AWS CLI installation you approved earlier. Access-key verification can contact STS before saving; SSO login is offered only after saving. Background mode never opens the installer or SSO browser. A verified STS identity still does **not** prove access to the chosen S3 prefix.
-
-## Setup and reconfiguration
-
-The wizard collects workstation ID, authentication method, region, local folder, bucket/prefix and sync options. Authentication choices are:
-
-1. **Access keys** (`auth_method=access_keys`, default for old configurations): new access/secret keys and an optional session token are masked and written only after final confirmation, to the dedicated `sync-agent` profile. Explicit new-key setup removes conflicting provider directives only from that dedicated profile; other AWS profiles and SSO-session sections remain intact.
-2. **Browser SSO** (`sso`): select an existing IAM Identity Center profile. The wizard validates its structure without requesting credentials, then offers browser login only after the approved settings save. Provision the organization-managed profile beforehand using `aws configure sso --profile company-sso`. IAM Identity Center must already be enabled and permissioned by your AWS administrator. The application does not provision an organization, permission set or account access.
-3. **Roles Anywhere** (`roles_anywhere`): select an existing trusted profile configured with `credential_process` and an administrator-provisioned signing helper, certificate/private-key source, trust anchor, Roles Anywhere profile and IAM role. No certificate, private key, signing helper or AWS infrastructure is provisioned/downloaded by this wizard. A credential process executes a local program when credentials are requested: inspect and trust it first. The application checks profile structure, not certificate authenticity or the helper's publisher.
-4. **AWS workload/default credential chain** (`workload_role`): do not explicitly select a profile. boto3 uses its normal provider chain, including EC2/container roles when applicable. This is NOT a role-only security boundary: environment credentials, environment-selected/default profiles and other SDK providers can take precedence. Best used in a deliberately configured AWS workload environment.
-5. **Other existing AWS profile** (`profile`): use a trusted preconfigured profile, including assume-role or other SDK-supported providers. Profile validation does not itself establish AWS permissions.
-
-Non-key options do not rewrite shared AWS configuration or credential files. Profile-based modes explicitly select the configured profile; background sync never initiates SSO browser login. SSO login separately updates AWS CLI-managed token caches, and a configured process provider can have its own side effects. Temporary credentials can refresh through the SDK, but an expired SSO login session still needs interactive sign-in again. `--login` performs that explicit browser login; `--check-auth` requests STS identity, reports the account/principal when its fields pass display validation, and can execute a selected credential helper. Neither is proof of S3 authorization.
-
-Local profile validation reads AWS configuration/credentials files without requesting credentials or executing a helper. SSO and Roles Anywhere modes refuse profiles containing competing/static credential providers. Explicit SSO login has a 300-second process timeout; STS identity checks use 5-second connection and 10-second read timeouts with one attempt. SDK timeouts do not bound third-party credential helper execution: a broken or interactive helper can still block credential resolution. Configure and test a trusted noninteractive helper before unattended sync.
-
-Presigned URLs are deliberately not a full-sync authentication mode: they grant selected object operations and do not provide the bucket listing and general conditional operations this engine requires. They would need a separate limited transfer feature.
-
-Credential files are ordinary AWS shared files, not encrypted storage. Protect them with Windows account/file permissions. The setup identity check calls STS using the selected profile; synchronization also requires S3 permissions and may incur AWS charges.
-
-```bat
-SyncAgent.exe --reconfigure
-SyncAgent.exe --reconfigure-all
-```
-
-Partial reconfiguration offers identity, authentication/region, paths and sync/startup options. Cancel leaves the running agent and saved configuration untouched. Saving validates first, requests a cooperative stop, and holds the singleton lock while applying changes. Credentials/config/startup writes are rolled back on failure where possible; errors are reported. Restart is offered after a successful save. An active transfer that cannot stop in time prevents applying changes; do not force-kill it to continue.
-
-### Choose an authentication method
-
-Choose the credential source that is already provisioned for your environment. This is a choice map, not an automatic security ranking or an infrastructure-provisioning wizard.
+Put a file in your sync folder: it appears in S3 a few seconds later.
 
 ```mermaid
 flowchart LR
-    accTitle: Five supported authentication choices
-    accDescr: Four choices use named profiles. Workload mode instead uses the default SDK credential chain without an explicit profile; it is not role-only.
-    Choice{"Choose credential source"}
-    Choice --> Keys["Access keys<br/>Dedicated sync-agent profile<br/>Optional session token"]
-    Choice --> SSO["Browser SSO<br/>Existing Identity Center profile<br/>Explicit browser login"]
-    Choice --> Roles["Roles Anywhere<br/>Existing trusted helper profile<br/>Certificate setup required"]
-    Choice --> Other["Other existing profile<br/>Trusted SDK-supported provider<br/>For example: assume-role"]
-    Choice --> Workload["AWS workload / default chain<br/>No explicit profile<br/>NOT guaranteed role-only"]
-    Keys --> SDK["boto3<br/>credential resolution"]
-    SSO --> SDK
-    Roles --> SDK
-    Other --> SDK
-    Workload --> SDK
-    classDef process fill:#dbeafe,stroke:#1d4ed8,color:#172554
-    classDef decision fill:#fef3c7,stroke:#b45309,color:#78350f
-    class Choice,Workload decision
-    class Keys,SSO,Roles,Other,SDK process
+    accTitle: First installation
+    accDescr: Run the installer, confirm, answer the setup wizard, review and save, then the agent starts in the tray.
+    A["Double-click<br/>SyncAgentSetup.exe"] --> B["Confirm install<br/>(per user, no admin)"]
+    B --> C["AWS CLI check<br/>(offers to install it)"]
+    C --> D["Setup wizard<br/>4 short steps"]
+    D --> E{"Save these<br/>settings?"}
+    E -->|"Yes"| F["Start in the tray"]
+    E -->|"No"| G["Nothing saved<br/>run setup again later"]
+    classDef work fill:#dbeafe,stroke:#1d4ed8,color:#172554
+    classDef decide fill:#fef3c7,stroke:#b45309,color:#78350f
+    classDef done fill:#dcfce7,stroke:#15803d,color:#14532d
+    classDef stop fill:#fee2e2,stroke:#b91c1c,color:#7f1d1d
+    class A,B,C,D work
+    class E decide
+    class F done
+    class G stop
 ```
 
-Local profile validation does not execute a helper or authenticate to AWS. Actual credential resolution and `--check-auth` can execute a configured helper; SSO browser sign-in is explicit. Shared credentials stay outside `config.json`. See the method-specific caveats above before selecting a provider.
+> **First time?** Use an empty test folder and an empty, versioned test bucket or prefix, and keep both deletion options **off**. More detail is in the [installation guide](docs/installation.md).
 
-### Reconfiguration without interrupting on cancel
+## Setting it up
+
+The setup wizard opens automatically after installing. You can run it again any time from the Start Menu (**Sync Agent**, when not yet configured) or with `SyncAgent.exe --setup`. Each answer is checked straight away, and a mistake only re-asks that one question.
+
+<details>
+<summary><b>See a complete setup session</b></summary>
+
+![Setup wizard: steps 1–4, review and start](docs/images/setup-wizard.svg)
+
+</details>
 
 ```mermaid
-flowchart TB
-    accTitle: Safe reconfiguration flow
-    accDescr: Review edits before confirmation. Cancel leaves the agent running. Saving requires cooperative stop and a maintenance lock, then applies changes with rollback on failure and offers restart only after success.
-    Edit["--reconfigure / --reconfigure-all<br/>Review staged edits"] --> Confirm{"Save edits?"}
-    Confirm -->|"No"| Cancel["Keep running agent<br/>Keep saved settings"]
-    Confirm -->|"Yes"| Validate["Validate settings + auth selection"]
-    Validate --> Stop["Request cooperative stop<br/>Acquire maintenance lock"]
-    Stop -->|"Cannot stop / lock"| Abort["Abort settings write<br/>Do not force-kill"]
-    Stop -->|"Lock acquired"| Apply["Apply config + startup<br/>Write staged keys if supplied"]
-    Apply -->|"Failure"| Rollback["Attempt rollback<br/>Report errors; inspect before retry"]
-    Apply -->|"Success"| Restart["Offer auth checks + restart<br/>Use status / logs to verify"]
-    classDef process fill:#dbeafe,stroke:#1d4ed8,color:#172554
-    classDef decision fill:#fef3c7,stroke:#b45309,color:#78350f
-    classDef stop fill:#fee2e2,stroke:#b91c1c,color:#7f1d1d
+flowchart TD
+    accTitle: Setup wizard steps
+    accDescr: AWS CLI check, then identity, AWS sign-in, folders, sync options, a review table and confirmation, then optional SSO sign-in or identity check, and start.
+    CLI["AWS CLI present?<br/>(offers verified download if not)"] --> S1["1 · Identity<br/>computer name"]
+    S1 --> S2["2 · AWS sign-in<br/>region + method"]
+    S2 --> S3["3 · Folders<br/>local folder, bucket, prefix"]
+    S3 --> S4["4 · Sync options<br/>timers, downloads, deletions,<br/>exclusions, start at login"]
+    S4 --> R{"Review table:<br/>save?"}
+    R -->|"No"| X["Nothing changed"]
+    R -->|"Yes"| Save["Settings saved<br/>(+ access keys if entered)"]
+    Save --> Auth["SSO: sign in in browser<br/>Other profiles: identity check"]
+    Auth --> Go["Start Sync Agent now?"]
+    classDef work fill:#dbeafe,stroke:#1d4ed8,color:#172554
+    classDef decide fill:#fef3c7,stroke:#b45309,color:#78350f
     classDef done fill:#dcfce7,stroke:#15803d,color:#14532d
-    class Edit,Validate,Stop,Apply process
-    class Confirm,Rollback decision
-    class Abort stop
-    class Cancel,Restart done
+    class CLI,S1,S2,S3,S4,Save,Auth work
+    class R decide
+    class X,Go done
 ```
 
-Validation or stop failure prevents applying the edits. Rollback is best effort, not a guarantee that every external side effect can be undone. Changing the sync destination or authentication identity can require baseline/migration review; it is not permission to erase the old baseline.
+### Step 1 · Identity
 
-## Commands
+| Question | Default | What to enter |
+| --- | --- | --- |
+| Workstation ID | your computer name | A short name for this PC (letters, digits, `-`, `_`). It names the log file and the suggested S3 prefix. |
 
-Run commands from the installed directory or use the full executable path (the installer does not modify PATH).
+### Step 2 · AWS sign-in
 
-```bat
-SyncAgent.exe                       rem setup if unconfigured; otherwise run
-SyncAgent.exe --setup
-SyncAgent.exe --background          rem noninteractive; refuses missing configuration
-SyncAgent.exe --status
-SyncAgent.exe --login               rem explicit SSO browser sign-in only
-SyncAgent.exe --check-auth          rem contacts STS; may execute a profile helper
-SyncAgent.exe --logs                rem print recent log tail
-SyncAgent.exe --logs --follow
-SyncAgent.exe --stop                rem cooperative, token-scoped singleton stop
-SyncAgent.exe --reconfigure
-SyncAgent.exe --reconfigure-all
-SyncAgent.exe --uninstall
-SyncAgent.exe --import-config FILE  rem apply prepared settings; add --yes to skip prompts
-SyncAgent.exe --version
-```
+| Question | Default | What to enter |
+| --- | --- | --- |
+| AWS region | `eu-central-1` | The region of your bucket, e.g. `us-east-1`. |
+| Authentication method | `1` (or your current choice) | How Sync Agent gets credentials (see below). |
 
-The tray offers Sync now, status, SSO sign-in (when selected), AWS identity check, local folder, logs, reconfiguration, uninstallation and Quit. Maintenance opens a separate console; cancellation does not shut down the agent. Inspect logs for synchronization conflicts and failures; the tray icon is not a detailed health indicator.
+| Choice | Use it when | You will be asked for |
+| --- | --- | --- |
+| **1 · Access keys** | Simple setups with a dedicated IAM user | Access key ID, secret (hidden), optional session token. Checked with AWS immediately, saved only after the final review, and only to the `sync-agent` AWS profile. |
+| **2 · Browser SSO** | Your company signs in to AWS through IAM Identity Center | The name of a profile created with `aws configure sso --profile NAME`. Browser sign-in is offered after saving. |
+| **3 · Roles Anywhere** | An administrator installed a certificate and AWS signing helper | The name of that profile. |
+| **4 · Workload / default chain** | Sync Agent runs inside AWS (EC2, WorkSpaces) | Nothing: the standard AWS SDK search order is used. |
+| **5 · Other AWS profile** | You already have a named profile (e.g. assume-role) | The profile name. |
 
-## Configuration
+The wizard lists the AWS profiles it finds on the computer. Details and IAM policy: [docs/authentication.md](docs/authentication.md).
 
-Settings are validated on load and saved atomically. Unknown fields, including secret-key fields, are not retained in the validated configuration or shown by `--status`. Example:
+### Step 3 · Folders
+
+| Question | Default | What to enter |
+| --- | --- | --- |
+| Absolute local sync folder | `%USERPROFILE%\Sync Agent Data` | The folder to keep in sync; created if missing. It cannot be a drive root, your user folder itself, a link/junction, or inside Sync Agent's own folders. Avoid folders already synced by OneDrive or Dropbox. |
+| S3 bucket (name only) | — | The bucket **name only**, e.g. `example-company-sync` (an `s3://` prefix is stripped for you). The bucket must exist. |
+| S3 prefix | `workstations/<workstation ID>` | The "folder" inside the bucket, e.g. `team/reports`. Only objects under it are touched. |
+
+### Step 4 · Sync options
+
+Press **Enter** to keep each safe default.
+
+| Question | Default | Meaning |
+| --- | --- | --- |
+| Debounce seconds | `5` | Wait this long after a local change before syncing, so a burst of saves becomes one upload. |
+| Maximum attempts | `3` | Tries per S3 request on temporary AWS errors. |
+| Remote poll interval seconds | `30` | How often S3 is checked for changes made elsewhere. |
+| Transfer socket timeout seconds | `120` | Give up on a transfer that makes no progress for this long. |
+| Download new/changed S3 objects? | Yes | **No** makes Sync Agent upload-only. |
+| Include subfolders? | Yes | **No** syncs only files directly in the folder. |
+| Propagate baseline-confirmed local deletions to S3? | **No** | ⚠ Destructive. Deletes the S3 copy when you delete a synced file locally. |
+| Propagate baseline-confirmed remote deletions locally? | **No** | ⚠ Destructive. Deletes your local file when its S3 copy is deleted. |
+| Exclude globs, comma-separated | `*.tmp, *.part, ~$*, desktop.ini, Thumbs.db` | Files never synced (comma-separated, case-sensitive). |
+| Start on current-user Windows login? | No | Start Sync Agent in the tray when you sign in. |
+
+Finally a **review table** shows everything. Nothing is written, and a running agent is not touched, until you answer **Y** to *Save these settings?*.
+
+## Configuration settings
+
+Settings are stored in `%LOCALAPPDATA%\SyncAgent\config.json`, one file per Windows user. **No passwords or AWS keys are ever stored there.** Change them with **Reconfigure** in the tray menu (or `SyncAgent.exe --reconfigure`), which lets you edit one group (identity, sign-in, folders or options) and then review and save.
+
+| Setting | Default | Description |
+| --- | --- | --- |
+| `workstation_id` | computer name | Name of this computer; letters, digits, `_`, `-` (max 64). |
+| `local_path` | *(required)* | Absolute path of the folder to sync. Environment variables are not expanded. |
+| `s3_bucket` | *(required)* | Bucket name (not a URL). |
+| `s3_prefix` | *(required)* | Path inside the bucket, without leading/trailing `/`. |
+| `region` | `eu-central-1` | AWS region. |
+| `auth_method` | `access_keys` | `access_keys`, `sso`, `roles_anywhere`, `profile` or `workload_role`. |
+| `aws_profile` | `sync-agent` | AWS profile name. Must be `sync-agent` for access keys; omitted for `workload_role`. |
+| `sync_from_s3` | `true` | Download changes from S3 (`false` = upload only). |
+| `recursive` | `true` | Include subfolders. |
+| `delete_on_s3` | `false` | ⚠ Delete in S3 when a synced file is deleted locally. |
+| `delete_local` | `false` | ⚠ Delete locally when a synced object is deleted in S3. |
+| `exclude_patterns` | `["*.tmp", "*.part", "~$*", "desktop.ini", "Thumbs.db"]` | Wildcard patterns matched against file names and relative paths (case-sensitive). |
+| `debounce_secs` | `5` | 0–3600. Quiet time after a local change before syncing. |
+| `poll_interval` | `30` | 5–86400. Seconds between checks for S3 changes. |
+| `max_retries` | `3` | 1–10. Attempts per S3 request. |
+| `transfer_timeout` | `120` | 10–3600. Seconds without progress before a transfer is abandoned. |
+| `autostart` | `false` | Start in the tray at Windows sign-in. |
+| `notifications` | `true` | Show a Windows notification when a pass ends with conflicts or errors. |
+
+Example `config.json`:
 
 ```json
 {
-  "workstation_id": "ws22",
-  "local_path": "C:\\Users\\Example\\Documents\\SyncFiles",
-  "s3_bucket": "example-sync-bucket",
-  "s3_prefix": "workstations/ws22",
+  "workstation_id": "OFFICE-PC-07",
+  "local_path": "C:\\Users\\Alex\\Sync Agent Data",
+  "s3_bucket": "example-company-sync",
+  "s3_prefix": "workstations/OFFICE-PC-07",
   "region": "eu-central-1",
-  "auth_method": "access_keys",
-  "aws_profile": "sync-agent",
-  "debounce_secs": 5,
-  "poll_interval": 30,
-  "max_retries": 3,
-  "transfer_timeout": 60,
-  "recursive": true,
+  "auth_method": "sso",
+  "aws_profile": "company-sso",
   "sync_from_s3": true,
   "delete_on_s3": false,
   "delete_local": false,
-  "notifications": true,
-  "autostart": false,
-  "exclude_patterns": ["*.tmp", "*.part", "~$*", "desktop.ini", "Thumbs.db"]
+  "autostart": true
 }
 ```
 
-`delete_on_s3` permits propagation of a previously baselined local deletion. `delete_local` permits propagation of a previously baselined remote deletion. Neither flag authorizes clearing unrelated first-sync files. Both default to false; enabling either is destructive and should follow backup and disposable-data testing. `sync_from_s3=false` disables remote-to-local updates. The wizard leaves deletion propagation off unless already explicitly enabled in a validated configuration.
+> Changing the folder, bucket, prefix, profile or sign-in method starts a fresh sync history, so the next pass treats files present on both sides as conflicts rather than overwriting them. Full rules, validation details and more examples are in [docs/configuration.md](docs/configuration.md).
 
-The local folder must be absolute and separate from the application/settings directories. Do not use a filesystem root, another application's installation, a junction or a symbolic link. Transfer timeout bounds individual SDK connection/read operations, not the duration of an entire large transfer. A stop timeout reports failure while an in-flight operation may still finish; the singleton remains held through worker shutdown.
+## Everyday use
 
-## AWS permissions
+Right-click the tray icon:
 
-Use a dedicated least-privilege identity restricted to the configured bucket prefix. Scope `s3:ListBucket` to that prefix with an `s3:prefix` condition; scope `s3:GetObject` and `s3:PutObject` to the corresponding object ARN. Grant `s3:DeleteObject` only if remote deletion propagation is deliberately enabled. KMS-encrypted buckets can require additional key permissions. Avoid bucket-wide wildcard write/delete grants. Review IAM and bucket policies with your AWS administrator rather than copying a broad example policy.
+<img src="docs/images/tray-menu.png" alt="Tray menu: Sync now, Show status, Check AWS identity, Open local folder, View live logs, Reconfigure, Uninstall, Quit" width="300" align="right">
 
-Official references:
+| Menu item | What it does |
+| --- | --- |
+| **Sync now** | Run a pass immediately. |
+| **Show status** | Last result, conflicts/errors and all settings. |
+| **Sign in (SSO)** | Browser sign-in (SSO only). |
+| **Check AWS identity** | Shows which AWS account/role is used. |
+| **Open local folder** | Opens the sync folder in Explorer. |
+| **View live logs** | Follows the log as it is written. |
+| **Reconfigure** | Change settings (stops and restarts the agent). |
+| **Uninstall** | Removes the program, keeps your data. |
+| **Quit** | Stops syncing until next start. |
 
-- AWS CLI installation: https://docs.aws.amazon.com/cli/latest/userguide/getting-started-install.html
-- IAM Identity Center provider: https://docs.aws.amazon.com/sdkref/latest/guide/feature-sso-credentials.html
-- Roles Anywhere profiles: https://docs.aws.amazon.com/sdkref/latest/guide/access-rolesanywhere.html
-- boto3 credential chain: https://docs.aws.amazon.com/boto3/latest/guide/credentials.html
-- S3 conditional writes: https://docs.aws.amazon.com/AmazonS3/latest/userguide/conditional-writes.html
-- S3 conditional deletes: https://docs.aws.amazon.com/AmazonS3/latest/userguide/conditional-deletes.html
+<br clear="right">
 
-## Uninstall
+| Tray icon | Meaning |
+| --- | --- |
+| Plain | Up to date. |
+| Amber dot | A sync pass is running. |
+| Red dot | The last pass had conflicts or errors. Open **Show status**. |
+
+<details>
+<summary><b>See the status screen</b></summary>
+
+![SyncAgent.exe --status](docs/images/status.svg)
+
+</details>
+
+The same actions are available from a terminal. The installer does not change `PATH`, so use the full path, `"%LOCALAPPDATA%\Programs\SyncAgent\SyncAgent.exe"`:
 
 ```bat
+SyncAgent.exe                       :: start in the tray (or setup if not configured)
+SyncAgent.exe --status              :: state, last pass, settings
+SyncAgent.exe --logs [--follow]     :: recent log lines
+SyncAgent.exe --setup               :: full setup wizard
+SyncAgent.exe --reconfigure         :: change some settings
+SyncAgent.exe --login               :: SSO browser sign-in
+SyncAgent.exe --check-auth          :: verify AWS identity (does not prove S3 access)
+SyncAgent.exe --stop                :: stop the running agent safely
+SyncAgent.exe --import-config FILE [--yes]   :: apply prepared settings
 SyncAgent.exe --uninstall
+SyncAgent.exe --version
 ```
 
-Alternatively, run the bundled `uninstall.bat`. Confirmation is required unless `-Yes` was explicitly supplied. The uninstaller requests a safe stop and removes the current user's application/startup registration. It preserves the sync folder, S3 objects, configuration, logs, baselines, AWS CLI and all shared AWS profiles. It does not uninstall legacy applications or remove their tasks/exclusions. Retained credentials and data must be reviewed and removed separately if appropriate.
-
-### What uninstall removes and keeps
+## How syncing works
 
 ```mermaid
-flowchart TB
-    accTitle: Uninstall scope and data preservation
-    accDescr: After overlap checks and confirmation, verify the application tree and request a cooperative stop. On success remove only the owned app and current-user startup entry. Preserve local and S3 data, settings, baselines, AWS CLI and AWS profiles.
-    Request["SyncAgent.exe --uninstall<br/>or bundled uninstall.bat"] --> Scope["Check retained settings<br/>Refuse sync-folder overlap"]
-    Scope --> Confirm{"Remove app?"}
-    Confirm -->|"No"| Cancel["Cancel; leave agent installed"]
-    Confirm -->|"Yes"| Check["Verify owned app + plain directory tree<br/>Request cooperative stop if installed"]
-    Check -->|"Unsafe / stop failed"| Abort["Abort before removal<br/>Do not force-kill"]
-    Check -->|"Safe to continue"| Remove["Remove current-user startup entry<br/>Remove owned application bundle"]
-    Remove -->|"Success"| Kept["PRESERVED<br/>Local sync folder + S3 objects<br/>Config + logs + baselines<br/>AWS CLI + shared AWS profiles"]
-    Remove -->|"Failure"| Inspect["Report failure<br/>Inspect rollback / cleanup state"]
-    classDef process fill:#dbeafe,stroke:#1d4ed8,color:#172554
-    classDef decision fill:#fef3c7,stroke:#b45309,color:#78350f
+flowchart LR
+    accTitle: Sync Agent architecture
+    accDescr: Local file changes, a periodic S3 check and Sync now feed one sync worker, which compares the folder and S3 with the baseline and transfers files with conditional requests.
+    subgraph PC["Your PC"]
+        Events["File changes"] --> Worker["One sync worker"]
+        Poll["Every 30 s"] --> Worker
+        Tray["Sync now"] --> Worker
+        Worker <--> Folder[("Sync folder")]
+        Worker <--> Baseline[("Baseline<br/>last synced state")]
+    end
+    Worker <-->|"conditional requests"| S3[("S3 bucket / prefix")]
+    classDef work fill:#dbeafe,stroke:#1d4ed8,color:#172554
+    classDef data fill:#f1f5f9,stroke:#64748b,color:#0f172a
+    class Events,Poll,Tray,Worker work
+    class Folder,Baseline,S3 data
+```
+
+For every file, Sync Agent compares both sides with the **baseline**, a record of what both sides looked like after the last successful sync:
+
+```mermaid
+flowchart TD
+    accTitle: Per-file decision
+    accDescr: Files changed on one side are copied to the other. Files changed on both sides, or present on both sides before the first sync, are conflicts. Deletions are only copied when the matching deletion setting is on.
+    F(["A file"]) --> Q{"What changed since<br/>the last sync?"}
+    Q -->|"Nothing"| N["Nothing to do"]
+    Q -->|"New or edited locally"| U["Upload"]
+    Q -->|"New or edited in S3"| D["Download"]
+    Q -->|"Edited on both sides /<br/>on both sides before first sync"| C["Conflict:<br/>both copies kept, reported"]
+    Q -->|"Deleted on one side"| Del{"Matching deletion<br/>setting on?"}
+    Del -->|"No (default)"| K["Other copy kept,<br/>deletion remembered"]
+    Del -->|"Yes"| R["Delete the other copy<br/>(only if unchanged)"]
+    classDef work fill:#dbeafe,stroke:#1d4ed8,color:#172554
+    classDef decide fill:#fef3c7,stroke:#b45309,color:#78350f
     classDef stop fill:#fee2e2,stroke:#b91c1c,color:#7f1d1d
     classDef done fill:#dcfce7,stroke:#15803d,color:#14532d
-    class Request,Scope,Check,Remove process
-    class Confirm,Inspect decision
-    class Abort stop
-    class Cancel,Kept done
+    class U,D,R work
+    class Q,Del decide
+    class C stop
+    class N,K done
 ```
 
-Scope/ownership checks fail closed; invalid settings can stop uninstall before confirmation. App/startup rollback is attempted if staging or startup removal fails; a later cleanup failure can still leave staged files requiring review. Preserved AWS credentials are **not revoked** by uninstalling the application.
+Safety rules that always apply:
 
-## Development and validation
+- **Uploads** are snapshotted and use S3 conditional writes, so another computer's newer version is never silently overwritten.
+- **Downloads** go to a temporary file and replace the local file atomically, only if it has not changed meanwhile.
+- **Conflicts** are never merged or overwritten; resolve them by keeping the version you want ([how](docs/troubleshooting.md#conflicts)).
+- **Unsafe names** (Windows reserved names, case-only duplicates, links/junctions) are skipped and reported.
+- Uploads over 5 GiB are refused. Empty folders, permissions and metadata are not synced.
+- Sync is not a backup: enable **S3 bucket versioning** and keep independent backups.
+
+The full design, with start-up, scheduling, stop and installer flowcharts, is in [docs/architecture.md](docs/architecture.md).
+
+## Installing on other computers
+
+Copy **only `SyncAgentSetup.exe`**; it contains the whole application. To skip the wizard on each computer, put a prepared settings file beside it:
 
 ```text
-python -m pip install -r requirements-dev.txt
-python -m pytest tests -q
-python main.py --help
-python main.py --status
+USB stick or share\
+├── SyncAgentSetup.exe
+└── SyncAgent.config.json   ← edited copy of examples/SyncAgent.config.example.json
 ```
 
-Tests use temporary directories, fake stores and mocked download/MSI boundaries; never put real credentials in tests. Bootstrap and lifecycle behavior can also be tested with portable PowerShell using `SYNC_AGENT_TEST_PWSH=/absolute/path/to/pwsh`; those runs mock process, network and registry boundaries and do not establish native Windows behavior. Native Windows locks, signatures, MSI execution and frozen GUI behavior still require Windows acceptance tests. The GitHub Actions Windows workflow parses PowerShell, runs the offline suite, builds the bundle and `SyncAgentSetup.exe`, smoke-tests packaged `--help` for both, and opts into the native packaged install/upgrade/uninstall and junction tests on its disposable Windows runner. A workflow definition is not evidence that the workflow has run successfully. The workflow is manual-only (`workflow_dispatch`) to avoid automatic runner usage: open the repository's Actions tab, select **Windows distribution**, then **Run workflow** when you are ready to consume Actions minutes. Uploading or pushing alone does not trigger it. Windows runner/server testing also does not replace separate Windows 10 and Windows 11 desktop acceptance.
+```bat
+SyncAgentSetup.exe --yes    :: install, apply SyncAgent.config.json and start, without questions
+```
 
-Before release, test the full bundle on separate clean Windows 10 and Windows 11 installations: missing/present AWS CLI, declined setup, existing-profile preservation, paths with spaces/non-ASCII, login startup, two-instance rejection, stop during transfer, cancelled reconfiguration/uninstall, successful upgrade and failure rollback, retained user data, and uninstall. Then use disposable AWS objects to verify conflicts, deletion defaults, conditional-write failure and restart behavior before any valuable-data deployment.
+- The settings file holds no credentials. Each computer still needs a working AWS profile (SSO, Roles Anywhere, or keys in the `sync-agent` profile).
+- Use a `local_path` that exists on every computer, e.g. `C:\Users\Public\Sync Agent Data`; `%USERPROFILE%` is not expanded.
+- Every computer using the same file shares the same `s3_prefix`, and therefore syncs with the others. Give each computer its own copy with a different prefix if they should be separate.
 
-### Testing the one-file installer
+Other installer options: `--config FILE` (settings file elsewhere), `--no-configure` (install only), `--no-startup` (never start at login). Details: [docs/configuration.md](docs/configuration.md#prepared-settings-for-many-computers).
 
-Get `SyncAgentSetup.exe` either by running `build.bat` on Windows, or from the **SyncAgentSetup-windows** artifact of a manual **Windows distribution** workflow run (`gh workflow run windows.yml --ref <branch>`).
+## Uninstalling
 
-Test on a disposable machine: the installer writes to `%LOCALAPPDATA%` and the current-user Run key. **Windows Sandbox** (Windows 10/11 Pro: *Turn Windows features on or off → Windows Sandbox*) is reset each time it closes; a VM snapshot also works. Copy only `SyncAgentSetup.exe` into it.
+Use **Settings → Apps → Installed apps → Sync Agent → Uninstall**, the tray menu's **Uninstall**, or `SyncAgent.exe --uninstall`.
 
-| Test | How | Expected |
-|---|---|---|
-| Fresh install | Double-click `SyncAgentSetup.exe` | Plan shown → confirm → installed to `%LOCALAPPDATA%\Programs\SyncAgent` → setup wizard opens |
-| Cancel | Run again and answer **n** | "Installation cancelled; no changes made." |
-| Wizard without AWS changes | Complete the wizard, answer **n** at "Save these settings?" | Review table shown; nothing saved |
-| Status | `"%LOCALAPPDATA%\Programs\SyncAgent\SyncAgent.exe" --status` | Agent state, last pass and settings table |
-| Upgrade | Run `SyncAgentSetup.exe` again after saving settings | "Upgrade existing installation"; settings kept; start offered |
-| Prepared settings | Place an edited copy of `SyncAgent.config.example.json`, renamed `SyncAgent.config.json`, beside the installer and run it | Settings table shown and applied without the wizard |
-| Unattended | `SyncAgentSetup.exe --yes --config SyncAgent.config.json` | No prompts; installs, applies settings and starts the agent |
-| Invalid settings | Use a file with `"s3_bucket": "s3://bad"` | Rejected before the running agent is stopped |
-| Uninstall | `SyncAgent.exe --uninstall` | Application removed; `%LOCALAPPDATA%\SyncAgent` and synced files kept |
+This removes the program, the Start Menu shortcut, the Installed apps entry and the login startup entry. It **keeps** your sync folder, everything in S3, settings and logs (`%LOCALAPPDATA%\SyncAgent`), the AWS CLI and your AWS profiles. To remove those too, see [troubleshooting](docs/troubleshooting.md#removing-sync-agent-completely).
 
-Any test that actually synchronizes must use an empty local folder and a disposable S3 bucket/prefix, with both deletion options left **off**.
+## Building from source
+
+Requires Windows and 64-bit [Python](https://www.python.org/downloads/windows/) 3.10+ (3.12 recommended).
+
+```bat
+git clone <this repository>
+cd sync_agent
+build.bat
+```
+
+`build.bat` creates an isolated environment, runs the full test suite, and produces:
+
+| Output | Use |
+| --- | --- |
+| `dist\SyncAgentSetup.exe` | The single file to give to users |
+| `dist\SyncAgent\` | The same application as a folder (install with its `install.bat`) |
+
+Run the tests on their own with `python -m pip install -r requirements-dev.txt` then `python -m pytest`. See the [development guide](docs/development.md) and [testing guide](docs/testing.md).
+
+## Project structure
+
+```text
+├── src/            Application source (entry point: src/main.py)
+├── scripts/        install / uninstall / AWS CLI PowerShell scripts shipped with the app
+├── examples/       Prepared settings template
+├── docs/           Guides, flowcharts and screenshots
+├── tests/          Offline test suite (+ opt-in native and live tests)
+├── build.bat       Builds the installer and application folder
+├── pyproject.toml  Project metadata and pytest settings
+└── requirements*.txt
+```
+
+## Documentation
+
+| Guide | Contents |
+| --- | --- |
+| [Installation](docs/installation.md) | Step-by-step install, first run and first tests |
+| [Configuration](docs/configuration.md) | Every setting, validation rules, examples, mass deployment |
+| [Authentication](docs/authentication.md) | The five sign-in methods and a least-privilege IAM policy |
+| [Architecture](docs/architecture.md) | How it works, with flowcharts; files it creates |
+| [Troubleshooting](docs/troubleshooting.md) | Common problems and fixes |
+| [Testing](docs/testing.md) | Test levels, native and live acceptance checklist |
+| [Development](docs/development.md) | Repository layout, running from source, building, releasing |
+| [Changelog](CHANGELOG.md) | What changed in each version |
+
+## Status and safety
+
+Sync Agent has been tested natively on Windows 11 (automated suite, packaged install/upgrade/uninstall, tray). Windows 10 and live S3 acceptance should be run with your own disposable resources before syncing valuable data: see [docs/testing.md](docs/testing.md). The executables are not code-signed.

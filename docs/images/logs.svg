@@ -1,0 +1,81 @@
+<svg class="rich-terminal" viewBox="0 0 1385 196.39999999999998" xmlns="http://www.w3.org/2000/svg">
+    <!-- Generated with Rich https://www.textualize.io -->
+    <style>
+
+    @font-face {
+        font-family: "Fira Code";
+        src: local("FiraCode-Regular"),
+                url("https://cdnjs.cloudflare.com/ajax/libs/firacode/6.2.0/woff2/FiraCode-Regular.woff2") format("woff2"),
+                url("https://cdnjs.cloudflare.com/ajax/libs/firacode/6.2.0/woff/FiraCode-Regular.woff") format("woff");
+        font-style: normal;
+        font-weight: 400;
+    }
+    @font-face {
+        font-family: "Fira Code";
+        src: local("FiraCode-Bold"),
+                url("https://cdnjs.cloudflare.com/ajax/libs/firacode/6.2.0/woff2/FiraCode-Bold.woff2") format("woff2"),
+                url("https://cdnjs.cloudflare.com/ajax/libs/firacode/6.2.0/woff/FiraCode-Bold.woff") format("woff");
+        font-style: bold;
+        font-weight: 700;
+    }
+
+    .terminal-2926193579-matrix {
+        font-family: Fira Code, monospace;
+        font-size: 20px;
+        line-height: 24.4px;
+        font-variant-east-asian: full-width;
+    }
+
+    .terminal-2926193579-title {
+        font-size: 18px;
+        font-weight: bold;
+        font-family: arial;
+    }
+
+    .terminal-2926193579-r1 { fill: #c5c8c6 }
+.terminal-2926193579-r2 { fill: #b2b2b2 }
+.terminal-2926193579-r3 { fill: #d0b344 }
+.terminal-2926193579-r4 { fill: #cc555a }
+    </style>
+
+    <defs>
+    <clipPath id="terminal-2926193579-clip-terminal">
+      <rect x="0" y="0" width="1365.3999999999999" height="145.39999999999998" />
+    </clipPath>
+    <clipPath id="terminal-2926193579-line-0">
+    <rect x="0" y="1.5" width="1366.4" height="24.65"/>
+            </clipPath>
+<clipPath id="terminal-2926193579-line-1">
+    <rect x="0" y="25.9" width="1366.4" height="24.65"/>
+            </clipPath>
+<clipPath id="terminal-2926193579-line-2">
+    <rect x="0" y="50.3" width="1366.4" height="24.65"/>
+            </clipPath>
+<clipPath id="terminal-2926193579-line-3">
+    <rect x="0" y="74.7" width="1366.4" height="24.65"/>
+            </clipPath>
+<clipPath id="terminal-2926193579-line-4">
+    <rect x="0" y="99.1" width="1366.4" height="24.65"/>
+            </clipPath>
+    </defs>
+
+    <rect fill="#292929" stroke="rgba(255,255,255,0.35)" stroke-width="1" x="1" y="1" width="1383" height="194.4" rx="8"/><text class="terminal-2926193579-title" fill="#c5c8c6" text-anchor="middle" x="691" y="27">SyncAgent.exe&#160;--logs&#160;--follow</text>
+            <g transform="translate(26,22)">
+            <circle cx="0" cy="0" r="7" fill="#ff5f57"/>
+            <circle cx="22" cy="0" r="7" fill="#febc2e"/>
+            <circle cx="44" cy="0" r="7" fill="#28c840"/>
+            </g>
+        
+    <g transform="translate(9, 41)" clip-path="url(#terminal-2926193579-clip-terminal)">
+    
+    <g class="terminal-2926193579-matrix">
+    <text class="terminal-2926193579-r2" x="24.4" y="20" textLength="524.6" clip-path="url(#terminal-2926193579-line-0)">Following&#160;log&#160;output;&#160;press&#160;Ctrl+C&#160;to&#160;stop.</text><text class="terminal-2926193579-r1" x="1366.4" y="20" textLength="12.2" clip-path="url(#terminal-2926193579-line-0)">
+</text><text class="terminal-2926193579-r2" x="0" y="44.4" textLength="1134.6" clip-path="url(#terminal-2926193579-line-1)">2026-10-22&#160;09:14:02,118&#160;INFO&#160;Found&#160;credentials&#160;in&#160;shared&#160;credentials&#160;file:&#160;~/.aws/credentials</text><text class="terminal-2926193579-r1" x="1366.4" y="44.4" textLength="12.2" clip-path="url(#terminal-2926193579-line-1)">
+</text><text class="terminal-2926193579-r2" x="0" y="68.8" textLength="780.8" clip-path="url(#terminal-2926193579-line-2)">2026-10-22&#160;09:14:05,402&#160;INFO&#160;Sync&#160;pass:&#160;2&#160;uploaded,&#160;1&#160;downloaded</text><text class="terminal-2926193579-r1" x="1366.4" y="68.8" textLength="12.2" clip-path="url(#terminal-2926193579-line-2)">
+</text><text class="terminal-2926193579-r3" x="0" y="93.2" textLength="841.8" clip-path="url(#terminal-2926193579-line-3)">2026-10-22&#160;09:31:47,915&#160;WARNING&#160;Plans/budget.xlsx:&#160;both&#160;sides&#160;changed</text><text class="terminal-2926193579-r1" x="1366.4" y="93.2" textLength="12.2" clip-path="url(#terminal-2926193579-line-3)">
+</text><text class="terminal-2926193579-r2" x="0" y="117.6" textLength="610" clip-path="url(#terminal-2926193579-line-4)">2026-10-22&#160;09:32:18,006&#160;INFO&#160;Sync&#160;pass:&#160;1&#160;uploaded</text><text class="terminal-2926193579-r1" x="1366.4" y="117.6" textLength="12.2" clip-path="url(#terminal-2926193579-line-4)">
+</text><text class="terminal-2926193579-r4" x="0" y="142" textLength="817.4" clip-path="url(#terminal-2926193579-line-5)">2026-10-22&#160;10:02:40,551&#160;ERROR&#160;Archive/large-video.mp4:&#160;TimeoutError</text><text class="terminal-2926193579-r1" x="1366.4" y="142" textLength="12.2" clip-path="url(#terminal-2926193579-line-5)">
+</text>
+    </g>
+    </g>
+</svg>
