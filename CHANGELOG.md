@@ -19,6 +19,10 @@ All notable changes to Sync Agent. Dates are YYYY-MM-DD.
 - The test suite failed on native Windows (symlink privilege, long paths), which blocked `build.bat`.
 
 ### Added
+- Code signing in `build.bat` and CI (`scripts/sign.ps1`): SHA-256, timestamped; signs the application before it is embedded in the installer. Activated by a `.pfx` or certificate thumbprint, or by the `SIGN_PFX_BASE64` / `SIGN_PFX_PASSWORD` repository secrets.
+- `scripts/acceptance-test.ps1`: one-command Windows 10/11 acceptance test of `SyncAgentSetup.exe` (20 checks, isolated, restores existing installations); also run by CI.
+- `tests/test_live_e2e.py`: opt-in end-to-end sync test against real S3.
+- AWS errors now show their code (e.g. `ClientError(AccessDenied)`) and explain a wrong PC clock, a wrong secret key or an unknown access key.
 - Start Menu shortcut and a per-user *Installed apps* entry; uninstall from Windows Settings.
 - New application icon; the tray icon shows an amber dot while syncing and a red dot after conflicts or errors, plus a tooltip.
 - Starting `SyncAgent.exe` when configured runs it in the tray and closes the window.

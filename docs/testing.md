@@ -29,10 +29,45 @@ PowerShell lifecycle tests run the real `scripts\*.ps1` with process, network an
 
 ### Latest recorded run — 2026-10-22, Windows 11 Home (10.0.26200), Python 3.11, Windows PowerShell 5.1
 
-- Offline suite: **192 passed, 5 skipped, 21 subtests passed**.
-- Native packaged tests (`tests/test_native_bundle.py` against a freshly built `dist\SyncAgent`): **2 passed**. These covered the frozen install, upgrade, uninstall, Start Menu shortcut, Installed apps entry and junction rejection.
-- Manual: the one-file installer ran unattended into a temporary profile; the background agent ran against a dead local endpoint and stopped cleanly; tray actions and the confirmation dialog were exercised.
-- Not run: Windows 10, live S3, AWS CLI download/MSI, real SSO or Roles Anywhere.
+| Level | Result |
+| --- | --- |
+| Offline suite | **211 passed**, 6 skipped (opt-in live and native tests, symlink privilege), 21 subtests passed |
+| Native packaged tests (`tests/test_native_bundle.py`) | **2 passed**: frozen install, upgrade, uninstall, Start Menu shortcut, Installed apps entry, junction rejection |
+| One-command acceptance (`scripts\acceptance-test.ps1`) | **20 / 20 checks passed** on Windows 11, with an existing Sync Agent installation on the same account restored byte-for-byte |
+| Code signing pipeline | Verified with a temporary self-signed certificate: both executables signed (SHA-256), timestamped, and still run correctly |
+| Manual | Tray actions, the confirmation dialog and keyboard focus exercised; the background agent ran and stopped cleanly |
+| **Windows 10** | **Pending**: run `acceptance-test.ps1` on a Windows 10 PC |
+| **Live S3** (`test_live_s3.py`, `test_live_e2e.py`) | **Pending**: blocked on the test PC. AWS rejected the configured access key (`InvalidAccessKeyId`), and the PC clock was 2 h behind. No object was written. The end-to-end test logic passes against the offline fake store. |
+| **Real code-signing certificate** | **Pending**: requires a certificate issued to the publisher (see [development.md](development.md#code-signing)) |
+| Not covered | AWS CLI download/MSI, real SSO and Roles Anywhere sessions |
+
+## Windows 10 / 11 acceptance in one command (no Python needed)
+
+Copy **`scripts\acceptance-test.ps1`** and **`SyncAgentSetup.exe`** into the same folder on the PC to test, then run in PowerShell or cmd:
+
+```bat
+powershell -ExecutionPolicy Bypass -File .\acceptance-test.ps1
+```
+
+It installs, configures, starts, stops, upgrades and uninstalls the real application in throwaway folders, prints PASS/FAIL for 20 checks, and saves `acceptance-result.txt` beside the installer: send that file back. It is safe on an ordinary PC:
+
+- your real `%LOCALAPPDATA%` and Start Menu are not used (they point to a temporary folder for the test);
+- no AWS request is made (fake credentials, unreachable endpoint);
+- the two per-user registry entries it cannot redirect (start at login, Installed apps) are backed up and restored exactly, so an existing Sync Agent installation keeps working;
+- everything it created is removed at the end.
+
+```mermaid
+flowchart LR
+    accTitle: Acceptance script stages
+    accDescr: The script checks the installer, installs, checks settings and status, starts and stops the agent, upgrades, uninstalls, then restores and cleans up.
+    A["Installer starts<br/>+ signature"] --> B["Install<br/>shortcut, Installed apps"] --> C["Status / settings<br/>background refusal"] --> D["Start in tray<br/>cooperative stop"] --> E["Upgrade<br/>settings kept"] --> F["Uninstall<br/>data kept"] --> G["Restore + clean up<br/>PASS / FAIL report"]
+    classDef work fill:#dbeafe,stroke:#1d4ed8,color:#172554
+    classDef done fill:#dcfce7,stroke:#15803d,color:#14532d
+    class A,B,C,D,E,F work
+    class G done
+```
+
+Afterwards, confirm the four manual checks printed at the end (wizard prompts, tray icon, clickable dialog, login start). The CI workflow runs the same script on its Windows runner.
 
 ## 1. Native packaged tests (disposable Windows account/VM only)
 
@@ -83,13 +118,17 @@ $env:SYNC_AGENT_LIVE_PROFILE = 'YOUR-TEST-PROFILE'
 $env:SYNC_AGENT_LIVE_AUTH_METHOD = 'profile' # or sso / roles_anywhere
 $env:SYNC_AGENT_LIVE_REGION = 'eu-central-1'
 $env:SYNC_AGENT_LIVE_S3 = 'I_ACCEPT_TEST_OBJECT_WRITES'
-.\.venv-build\Scripts\python.exe -m pytest tests/test_live_s3.py -q
+.\.venv-build\Scripts\python.exe -m pytest tests/test_live_s3.py tests/test_live_e2e.py -q
 Remove-Item Env:\SYNC_AGENT_LIVE_S3
 ```
 
+The PC clock must be correct: AWS rejects requests from a clock more than 15 minutes off (`SignatureDoesNotMatch` / `RequestTimeTooSkewed`).
+
+`test_live_e2e.py` runs the real sync engine against a unique `sync-agent-acceptance/e2e-<UUID>/` prefix: first-sync conflict, upload, download into a subfolder, edits in both directions, a both-sides conflict (nothing overwritten), the default "local deletion is not propagated" rule, and a restart that must not resurrect the deleted file. At the end it deletes every object under that prefix with conditional deletes of the ETags it just listed.
+
 This creates a unique `sync-agent-acceptance/<UUID>/conditional-probe.txt`, verifies conditional creation/update/download/deletion and stale-ETag rejection, and reads back object state. Cleanup uses only that exact key and its last successfully returned ETag, never bulk or unconditional deletion. Failed/uncertain requests can leave a tiny test object: the bucket owner must review it. Custom endpoint environment overrides are refused. For workload-chain testing, use `workload_role` and no explicit profile in a controlled workload.
 
-Without the exact opt-in, this test is skipped. Offline guard tests verify that missing bucket/profile or custom endpoints fail before constructing an S3 client. A passing storage test is not full end-to-end sync acceptance: also exercise first-sync conflicts, both-side edits, deletion defaults, opt-in deletion, restart tombstones, edits during transfers and token expiry with the full application on disposable data.
+Without the exact opt-in, these tests are skipped. Offline guard tests verify that missing bucket/profile or custom endpoints fail before constructing an S3 client. A passing storage test is not full end-to-end sync acceptance: also exercise first-sync conflicts, both-side edits, deletion defaults, opt-in deletion, restart tombstones, edits during transfers and token expiry with the full application on disposable data.
 
 ## Record results honestly
 

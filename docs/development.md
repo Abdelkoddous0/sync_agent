@@ -26,7 +26,9 @@ sync_agent/
 ├── scripts/                     Windows lifecycle scripts shipped inside the build
 │   ├── install.ps1 / install.bat
 │   ├── uninstall.ps1 / uninstall.bat
-│   └── ensure_aws_cli.ps1       Verified AWS CLI download/install (with consent)
+│   ├── ensure_aws_cli.ps1       Verified AWS CLI download/install (with consent)
+│   ├── sign.ps1                 Code signing (used by build.bat and CI)
+│   └── acceptance-test.ps1      One-command Windows 10/11 acceptance test
 ├── examples/
 │   └── SyncAgent.config.example.json   Prepared settings template
 ├── docs/                        User and maintainer documentation (+ images/)
@@ -80,6 +82,65 @@ The build:
 5. builds `dist\SyncAgentSetup.exe`, a one-file installer embedding `dist\SyncAgent\`.
 
 Any failing step stops the build.
+
+## Code signing
+
+Unsigned programs trigger *"Windows protected your PC"* and are more often flagged by antivirus. Signing is built into `build.bat` and CI and switches on as soon as a certificate is configured. It signs `SyncAgent.exe` before it is embedded in the installer, then `SyncAgentSetup.exe`, using SHA-256 and an RFC 3161 timestamp, so signatures stay valid after the certificate expires.
+
+```mermaid
+flowchart LR
+    accTitle: Signing in the build
+    accDescr: The application is built and signed, embedded in the installer, and the installer is signed. Without a certificate both signing steps are skipped.
+    A["Build SyncAgent.exe"] --> S1{"Certificate<br/>configured?"}
+    S1 -->|"Yes"| SA["Sign + timestamp<br/>SyncAgent.exe"]
+    S1 -->|"No"| B
+    SA --> B["Build SyncAgentSetup.exe<br/>(embeds signed app)"]
+    B --> S2{"Certificate<br/>configured?"}
+    S2 -->|"Yes"| SB["Sign + timestamp<br/>SyncAgentSetup.exe"]
+    S2 -->|"No"| Done["Unsigned build"]
+    SB --> Signed["Signed build"]
+    classDef work fill:#dbeafe,stroke:#1d4ed8,color:#172554
+    classDef decide fill:#fef3c7,stroke:#b45309,color:#78350f
+    classDef done fill:#dcfce7,stroke:#15803d,color:#14532d
+    class A,SA,B,SB work
+    class S1,S2 decide
+    class Done,Signed done
+```
+
+**1. Get a certificate.** A code-signing certificate is issued to a verified person or organization; it cannot be generated locally. Options:
+
+| Option | Notes |
+| --- | --- |
+| **Azure Trusted Signing** | Low monthly cost; Microsoft-managed keys. Organization or individual identity validation. Use Microsoft's signing tool instead of a `.pfx`. |
+| **OV code-signing certificate** (DigiCert, Sectigo, GlobalSign, SSL.com …) | Since 2023 issued on a hardware token or cloud HSM, so it is used with `-Thumbprint`. SmartScreen warnings fade as the signed file gains reputation. |
+| **EV code-signing certificate** | Hardware token; strongest identity validation. |
+| **Internal certificate** (company PKI) | Works on company PCs that trust your internal CA; external users still see warnings. |
+
+**2. Build signed locally:**
+
+```bat
+:: Certificate file (.pfx); the password is read from the environment only
+set SYNC_AGENT_SIGN_PFX=C:\certs\company-codesign.pfx
+set SYNC_AGENT_SIGN_PASSWORD=********
+build.bat
+
+:: Or a certificate in your Windows certificate store (hardware token / EV)
+set SYNC_AGENT_SIGN_THUMBPRINT=0123456789ABCDEF0123456789ABCDEF01234567
+build.bat
+```
+
+Verify with `powershell Get-AuthenticodeSignature dist\SyncAgentSetup.exe`: the status must be **Valid**. `scripts\sign.ps1` can also sign files directly.
+
+**3. Sign in CI.** Add two repository secrets (**Settings → Secrets and variables → Actions**):
+
+| Secret | Value |
+| --- | --- |
+| `SIGN_PFX_BASE64` | `powershell "[Convert]::ToBase64String([IO.File]::ReadAllBytes('company-codesign.pfx'))"` |
+| `SIGN_PFX_PASSWORD` | The `.pfx` password |
+
+The workflow then signs both executables and fails unless both signatures are **Valid**. Without the secrets it builds unsigned, as before.
+
+The pipeline was verified with a temporary self-signed test certificate: both files were signed with SHA-256, timestamped, and still ran correctly, including the one-file installer. A self-signed certificate is reported as untrusted by Windows, so it cannot replace a real one.
 
 ## Continuous integration
 

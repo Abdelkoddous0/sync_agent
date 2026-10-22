@@ -50,7 +50,7 @@ Sync Agent watches a local folder and an S3 "folder" (a bucket prefix) and copie
 **You need:** a 64-bit Windows 10 or 11 PC, an existing S3 bucket, and AWS credentials allowed to use it ([minimum permissions](docs/authentication.md#minimum-aws-permissions)).
 
 1. **Get the installer.** Build `dist\SyncAgentSetup.exe` with [`build.bat`](#building-from-source), or download the **SyncAgentSetup-windows** artifact from the repository's *Windows distribution* workflow.
-2. **Run it.** Double-click `SyncAgentSetup.exe` and confirm. If Windows shows *"Windows protected your PC"*, click **More info → Run anyway** (the program is not code-signed).
+2. **Run it.** Double-click `SyncAgentSetup.exe` and confirm. If Windows shows *"Windows protected your PC"*, click **More info → Run anyway** (builds are unsigned until a code-signing certificate is configured).
 3. **Answer the setup questions** ([explained below](#setting-it-up)). Defaults are pre-filled; press **Enter** to accept them.
 4. **Start it.** Answer **Y** to *Start Sync Agent now?*. The tray icon appears; it may be under the **^** arrow.
 
@@ -379,7 +379,16 @@ Run the tests on their own with `python -m pip install -r requirements-dev.txt` 
 | [Testing](docs/testing.md) | Test levels, native and live acceptance checklist |
 | [Development](docs/development.md) | Repository layout, running from source, building, releasing |
 | [Changelog](CHANGELOG.md) | What changed in each version |
+| [Presentation](docs/presentation/Sync-Agent-How-It-Works.pptx) | 16-slide PowerPoint overview with speaker notes |
 
 ## Status and safety
 
-Sync Agent has been tested natively on Windows 11 (automated suite, packaged install/upgrade/uninstall, tray). Windows 10 and live S3 acceptance should be run with your own disposable resources before syncing valuable data: see [docs/testing.md](docs/testing.md). The executables are not code-signed.
+| Area | Status |
+| --- | --- |
+| Automated tests | 211 passing on every build |
+| Windows 11 | Packaged install / upgrade / uninstall tests and the 20-check acceptance script pass |
+| Windows 10 | Pending: run [`scripts/acceptance-test.ps1`](scripts/acceptance-test.ps1) (one command) on a Windows 10 PC |
+| Live S3 | Pending: live tests are ready (`tests/test_live_s3.py`, `tests/test_live_e2e.py`) and need a valid test key |
+| Code signing | Built into `build.bat` and CI, verified with a test certificate; needs a real certificate ([how](docs/development.md#code-signing)) |
+
+Run the pending checks with disposable resources before syncing valuable data: see [docs/testing.md](docs/testing.md).

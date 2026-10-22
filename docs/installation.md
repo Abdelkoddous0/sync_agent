@@ -18,7 +18,7 @@ Use a disposable account/VM, a disposable local folder and a non-production S3 b
 
 Afterwards, open **Sync Agent** from the Start Menu at any time: it starts the tray agent, or opens setup if nothing is configured yet. Uninstall it from **Settings → Apps → Installed apps → Sync Agent**.
 
-> **Windows SmartScreen / Defender:** the executables are not code-signed, so Windows may show *"Windows protected your PC"*. Choose **More info → Run anyway** only for a build you produced or downloaded from your own trusted workflow. Organizations should sign `SyncAgentSetup.exe` and `SyncAgent.exe` before wide distribution.
+> **Windows SmartScreen / Defender:** the executables are not code-signed, so Windows may show *"Windows protected your PC"*. Choose **More info → Run anyway** only for a build you produced or downloaded from your own trusted workflow. Organizations should sign `SyncAgentSetup.exe` and `SyncAgent.exe` before wide distribution: `build.bat` signs both automatically once a certificate is configured ([how](development.md#code-signing)).
 
 ## 1. Build (source machine)
 

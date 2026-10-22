@@ -68,6 +68,9 @@ Install it manually from <https://docs.aws.amazon.com/cli/latest/userguide/getti
 
 | Symptom | Fix |
 | --- | --- |
+| Correct keys rejected with `SignatureDoesNotMatch` or `RequestTimeTooSkewed`, and *"This PC clock is … behind/ahead"* | AWS rejects requests from a PC whose clock is more than 15 minutes off. **Settings → Time & language → Date & time**: turn on **Set time automatically** and **Set time zone automatically**, then click **Sync now**. If Sync now fails (some networks block Windows time sync), turn **Set time automatically** off and set the time manually. Retry; no reconfiguration is needed. A wrong clock hides every other problem: if it still fails with the clock right, read the new error code. |
+| `SignatureDoesNotMatch` while the clock is correct | The secret key does not belong to that access key ID (often a copy/paste slip). `--reconfigure` → 2 → enter both keys again. |
+| `InvalidClientTokenId` / `InvalidAccessKeyId` | AWS does not know the access key ID: it was deleted, deactivated, belongs to another account, or was mistyped. Create a new access key in the IAM console (**Users → your user → Security credentials → Create access key**), then `--reconfigure` → 2 and enter it. |
 | Errors on every file after a few hours, method SSO | The SSO session expired: tray → **Sign in (SSO)**, or `--login`. |
 | `--check-auth` fails | Credentials are wrong or expired. For access keys: `--reconfigure` → 2 → enter new keys. |
 | `--check-auth` succeeds but every file errors | The identity lacks S3 permissions for this bucket/prefix (or KMS). See [minimum permissions](authentication.md#minimum-aws-permissions). |

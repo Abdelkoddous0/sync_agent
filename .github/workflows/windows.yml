@@ -5,6 +5,9 @@ on: [workflow_dispatch]
 jobs:
   test-build:
     runs-on: windows-latest
+    env:
+      # Code signing turns on when the repository has these secrets (see docs/development.md).
+      HAS_SIGNING: ${{ secrets.SIGN_PFX_BASE64 != '' }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -13,7 +16,7 @@ jobs:
       - name: Parse PowerShell without running installers
         shell: powershell
         run: |
-          foreach ($file in @('ensure_aws_cli.ps1', 'install.ps1', 'uninstall.ps1')) {
+          foreach ($file in @('ensure_aws_cli.ps1', 'install.ps1', 'uninstall.ps1', 'sign.ps1', 'acceptance-test.ps1')) {
             $tokens = $null
             $errors = $null
             [void][System.Management.Automation.Language.Parser]::ParseFile((Join-Path $pwd "scripts\$file"), [ref]$tokens, [ref]$errors)
@@ -28,9 +31,30 @@ jobs:
           if errorlevel 1 exit /b 1
           python -m compileall -q src tests
           if errorlevel 1 exit /b 1
-      - name: Build application and one-file installer
+      - name: Prepare code-signing certificate
+        if: env.HAS_SIGNING == 'true'
+        shell: powershell
+        env:
+          SIGN_PFX_BASE64: ${{ secrets.SIGN_PFX_BASE64 }}
+        run: |
+          $pfx = Join-Path $env:RUNNER_TEMP 'signing.pfx'
+          [IO.File]::WriteAllBytes($pfx, [Convert]::FromBase64String($env:SIGN_PFX_BASE64))
+          "SYNC_AGENT_SIGN_PFX=$pfx" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+      - name: Build application and one-file installer (signed when configured)
         shell: cmd
+        env:
+          SYNC_AGENT_SIGN_PASSWORD: ${{ secrets.SIGN_PFX_PASSWORD }}
         run: build.bat
+      - name: Require valid signatures
+        if: env.HAS_SIGNING == 'true'
+        shell: powershell
+        run: |
+          foreach ($file in @('dist\SyncAgent\SyncAgent.exe', 'dist\SyncAgentSetup.exe')) {
+            $signature = Get-AuthenticodeSignature -LiteralPath $file
+            if ($signature.Status -ne 'Valid') { throw "$file signature: $($signature.Status)" }
+            Write-Host "$file signed by $($signature.SignerCertificate.Subject)"
+          }
+          Remove-Item -LiteralPath $env:SYNC_AGENT_SIGN_PFX -Force
       - name: Verify packaged executables (no setup or cloud)
         shell: powershell
         run: |
@@ -48,6 +72,11 @@ jobs:
           $env:SYNC_AGENT_TEST_BUNDLE = Join-Path $pwd 'dist\SyncAgent'
           python -m pytest tests/test_native_bundle.py -q
           if ($LASTEXITCODE -ne 0) { throw 'Native packaged acceptance failed' }
+      - name: One-command acceptance test of SyncAgentSetup.exe
+        shell: powershell
+        run: |
+          powershell -NoProfile -ExecutionPolicy Bypass -File scripts\acceptance-test.ps1 -Installer dist\SyncAgentSetup.exe
+          if ($LASTEXITCODE -ne 0) { throw 'Acceptance test failed' }
       - uses: actions/upload-artifact@v4
         with:
           name: SyncAgent-windows
@@ -55,4 +84,6 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: SyncAgentSetup-windows
-          path: dist/SyncAgentSetup.exe
+          path: |
+            dist/SyncAgentSetup.exe
+            dist/acceptance-test.ps1

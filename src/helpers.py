@@ -105,7 +105,18 @@ def verify_aws(ak='', sk='', region='eu-central-1', session_token=''):
         with working('Verifying AWS credentials'):
             result = subprocess.run(command, env=env, capture_output=True, text=True, timeout=30, check=False)
         if result.returncode:
-            return False, 'AWS verification failed. Check credentials, session token, region, and connectivity.'
+            from aws_errors import CLOCK_CODES, MAX_SKEW_SECONDS, cli_error_code, clock_hint, measure_clock_skew
+            code = cli_error_code(result.stderr)
+            if code in CLOCK_CODES:
+                skew = measure_clock_skew(region)
+                if skew is not None and abs(skew) > MAX_SKEW_SECONDS:
+                    return False, f'AWS verification failed ({code}). ' + clock_hint(skew)
+            if code in ('InvalidClientTokenId', 'UnrecognizedClientException', 'InvalidAccessKeyId'):
+                return False, f'AWS verification failed ({code}): AWS does not know this access key ID.'
+            if code == 'SignatureDoesNotMatch':
+                return False, f'AWS verification failed ({code}): the secret key does not match this access key ID.'
+            return False, ('AWS verification failed' + (f' ({code})' if code else '')
+                           + '. Check credentials, session token, region, and connectivity.')
         account = json.loads(result.stdout).get('Account','unknown')
         return True, f'AWS account {account}'
     except (OSError,ValueError,RuntimeError,subprocess.SubprocessError) as exc:

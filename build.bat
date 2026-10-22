@@ -35,6 +35,18 @@ rem Generated .spec files go to build\ so the repository root stays clean.
 "%BPY%" -m PyInstaller --noconfirm --clean --onedir --console --noupx --specpath build --paths "%ROOT%\src" --icon "%ROOT%\build\SyncAgent.ico" --name SyncAgent --hidden-import watchdog.observers.winapi --hidden-import pystray._win32 --hidden-import plyer.platforms.win.notification --collect-all rich --collect-all pystray --collect-all plyer --add-data "%ROOT%\scripts\ensure_aws_cli.ps1;." --add-data "%ROOT%\scripts\install.ps1;." --add-data "%ROOT%\scripts\uninstall.ps1;." "%ROOT%\src\main.py"
 if errorlevel 1 exit /b 1
 if not exist "dist\SyncAgent\SyncAgent.exe" exit /b 1
+rem Optional code signing: set SYNC_AGENT_SIGN_PFX (+ SYNC_AGENT_SIGN_PASSWORD) or SYNC_AGENT_SIGN_THUMBPRINT.
+set "SIGN="
+if defined SYNC_AGENT_SIGN_PFX set "SIGN=-PfxPath "%SYNC_AGENT_SIGN_PFX%""
+if defined SYNC_AGENT_SIGN_THUMBPRINT set "SIGN=-Thumbprint %SYNC_AGENT_SIGN_THUMBPRINT%"
+set "SIGNPS=%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%ROOT%\scripts\sign.ps1""
+rem Sign the application before it is embedded in the installer.
+if defined SIGN (
+    %SIGNPS% %SIGN% %SYNC_AGENT_SIGN_EXTRA% -Path "dist\SyncAgent\SyncAgent.exe"
+    if errorlevel 1 exit /b 1
+) else (
+    echo Code signing skipped: no certificate configured ^(see docs\development.md^).
+)
 for %%F in (install.ps1 uninstall.ps1 ensure_aws_cli.ps1 install.bat uninstall.bat) do (
     copy /y "scripts\%%F" "dist\SyncAgent\%%F" >nul
     if errorlevel 1 exit /b 1
@@ -43,6 +55,13 @@ rem One-file installer: embeds the complete bundle, installs it, then runs setup
 "%BPY%" -m PyInstaller --noconfirm --clean --onefile --console --noupx --specpath build --paths "%ROOT%\src" --icon "%ROOT%\build\SyncAgent.ico" --name SyncAgentSetup --collect-all rich --add-data "%ROOT%\dist\SyncAgent;payload" "%ROOT%\src\installer.py"
 if errorlevel 1 exit /b 1
 if not exist "dist\SyncAgentSetup.exe" exit /b 1
+if defined SIGN (
+    %SIGNPS% %SIGN% %SYNC_AGENT_SIGN_EXTRA% -Path "dist\SyncAgentSetup.exe"
+    if errorlevel 1 exit /b 1
+)
+rem Ship the one-command acceptance test beside the installer.
+copy /y "scripts\acceptance-test.ps1" "dist\acceptance-test.ps1" >nul
+if errorlevel 1 exit /b 1
 echo Build ready: dist\SyncAgent\SyncAgent.exe
 echo Installer ready: dist\SyncAgentSetup.exe  (single file; double-click to install and configure)
 exit /b 0

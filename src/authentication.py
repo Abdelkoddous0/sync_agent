@@ -124,7 +124,12 @@ def verify_identity(cfg):
                                  + r':[A-Za-z0-9+=,.@_:/-]+', arn)):
             return True, f'AWS identity verified: account {account}, {arn}. S3 permissions not checked.'
         return True, 'AWS identity verified (principal details omitted). This does not prove S3 permissions.'
-    except Exception:
-        return False, ('AWS identity verification failed. Check the selected profile, '
+    except Exception as exc:
+        from aws_errors import MAX_SKEW_SECONDS, clock_hint, clock_skew_seconds, error_code
+        code = error_code(exc)
+        skew = clock_skew_seconds(exc)
+        if skew is not None and abs(skew) > MAX_SKEW_SECONDS:
+            return False, f'AWS identity verification failed ({code}). ' + clock_hint(skew)
+        return False, ('AWS identity verification failed' + (f' ({code})' if code else '') + '. Check the selected profile, '
                        'credentials or SSO session, helper configuration and connectivity. '
                        'For SSO, sign in explicitly with --login.')

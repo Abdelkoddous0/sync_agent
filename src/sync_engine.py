@@ -22,6 +22,8 @@ import threading
 import time
 import unicodedata
 
+from aws_errors import describe as describe_error
+
 
 def atomic_json(path, data):
     path = Path(path)
@@ -301,11 +303,11 @@ class SyncEngine:
                         self.baseline[name] = {'local':l, 'remote':r}
                         report['changed'].append(name)
                     except Exception as exc:
-                        # Provider/credential-process messages can contain credentials.
-                        report['errors'].append(name + ': ' + type(exc).__name__)
+                        # Provider/credential-process messages can contain credentials: code only.
+                        report['errors'].append(name + ': ' + describe_error(exc))
                 atomic_json(self.state_path, {'version':1, 'files':self.baseline})
             except Exception as exc:
-                report['errors'].append(type(exc).__name__)
+                report['errors'].append(describe_error(exc))
             self.last_report = report
             for issue in report['conflicts'] + report['errors']:
                 logging.warning('%s', issue)
