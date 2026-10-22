@@ -2,6 +2,35 @@
 
 Windows 10/11 desktop tray application for conservative file synchronization with an AWS S3 bucket prefix. The executable is `SyncAgent.exe`. It runs as the signed-in user, not as a Windows service.
 
+## How Sync Agent fits together
+
+One Windows tray app, one reconciliation worker, one configured S3 prefix. The arrows below show actual file/state access; the AWS CLI is **not** the transfer engine.
+
+```mermaid
+flowchart TB
+    accTitle: Sync Agent architecture
+    accDescr: Windows events, polling and manual requests feed one worker. The worker accesses local files and a persistent baseline and uses boto3 to access one S3 prefix.
+    subgraph PC["Windows 10 / 11"]
+        Events["Local file events"] --> Queue["Debounce + request scheduling"]
+        Poll["Periodic remote poll"] --> Queue
+        Tray["Tray: Sync now"] --> Queue
+        Queue --> Worker["One reconciliation worker"]
+        Files[("Local sync folder")] <--> Worker
+        Baseline[("Persistent baseline")] <--> Worker
+        Worker --> Report["Status + rotating logs"]
+        Worker <--> SDK["boto3 / botocore"]
+    end
+    SDK <-->|"Scoped S3 operations"| S3[("AWS S3<br/>Configured bucket / prefix")]
+    classDef process fill:#dbeafe,stroke:#1d4ed8,color:#172554
+    classDef data fill:#f1f5f9,stroke:#64748b,color:#0f172a
+    class Queue,Worker,SDK process
+    class Files,Baseline,S3 data
+```
+
+**Reading the diagrams:** arrows show the flow; diamonds are decisions. Blue boxes perform work, green boxes are completed outcomes, amber boxes need a decision/review, and red boxes stop or skip an unsafe action. Labels explain the meaning without relying on color.
+
+**Jump to:** [First installation](#installation-and-first-run) · [Authentication](#choose-an-authentication-method) · [Sync decisions](#how-a-sync-pass-decides) · [Reconfiguration](#reconfiguration-without-interrupting-on-cancel) · [Uninstall](#what-uninstall-removes-and-keeps)
+
 ## Safety and validation status
 
 Use a disposable local folder and a non-production S3 prefix for initial Windows testing. This repair has offline regression coverage; a passing Linux test run or PowerShell parse does not establish that native Windows installation, the packaged executable, or live S3 integration works. Native Windows 10 and Windows 11 acceptance testing remains required. No production AWS calls are necessary to run the tests.
@@ -18,6 +47,46 @@ Use a disposable local folder and a non-production S3 prefix for initial Windows
 - Enable S3 bucket versioning and maintain independent backups. Synchronization is not a backup service.
 
 Do not manually delete or edit the baseline to resolve conflicts: removing it changes first-sync/deletion semantics and can resurrect previously deleted data. Stop the agent, preserve copies of both sides, and resolve conflicts deliberately. Changing the local folder, bucket, prefix, profile or non-key authentication method creates a separate baseline identity. Access-key mode retains the prior profile-bound identity for compatibility; switching to a non-key method refuses an existing older identity until migration is reviewed, rather than silently dropping tombstones. Pre-release baselines that lack profile identity require explicit review/migration; the agent refuses to silently discard their tombstones and begin first sync.
+
+### How a sync pass decides
+
+This is a per-path overview, not a timestamp-based winner selection. A baseline is the last recorded local hash / remote ETag pair, including retained deletions.
+
+```mermaid
+flowchart TB
+    accTitle: Conservative per-path synchronization decisions
+    accDescr: Unsafe paths are skipped. Without a baseline, paths present on both sides conflict. With a baseline, unchanged paths are skipped, both-side changes conflict, and one-side changes follow guarded transfer or deletion rules.
+    Scan["Scan local files + list S3 prefix"] --> Safe{"Safe path?"}
+    Safe -->|"No"| Reject["Skip path + report conflict"]
+    Safe -->|"Yes"| Known{"Baseline?"}
+    Known -->|"No"| Both{"Both exist?"}
+    Both -->|"Yes"| Conflict["Preserve originals<br/>Report conflict for manual review"]
+    Both -->|"No"| Rules["Apply guarded transfer / deletion rules"]
+    Known -->|"Yes"| Changes{"Changed?"}
+    Changes -->|"Neither side"| Skip["No file operation"]
+    Changes -->|"Both; file remains"| Conflict
+    Changes -->|"Both now absent"| Absent["Record both absent<br/>No file operation"]
+    Changes -->|"One side"| Rules
+    Rules --> Save["Persist baseline + pass report"]
+    classDef process fill:#dbeafe,stroke:#1d4ed8,color:#172554
+    classDef decision fill:#fef3c7,stroke:#b45309,color:#78350f
+    classDef stop fill:#fee2e2,stroke:#b91c1c,color:#7f1d1d
+    classDef done fill:#dcfce7,stroke:#15803d,color:#14532d
+    class Scan,Rules,Save process
+    class Safe,Known,Both,Changes decision
+    class Reject,Conflict stop
+    class Skip,Absent done
+```
+
+| Guarded action | What must be true | If the guard fails |
+| --- | --- | --- |
+| Upload a new/changed local file | Stable local snapshot; conditional S3 write succeeds | Report error; no unconditional overwrite fallback |
+| Download a new/changed S3 object | Downloads enabled; no retained-deletion conflict; remote/local checks pass | Skip, report conflict or report error; do not blindly replace local data |
+| Propagate a local deletion to S3 | Baseline-confirmed deletion; `delete_on_s3=true`; conditional S3 delete succeeds | Preserve remote object; disabled deletions remain recorded |
+| Propagate a remote deletion locally | Baseline-confirmed deletion; downloads enabled; `delete_local=true`; local file still matches | Preserve local file; do not delete a newly edited file |
+| Revisit a retained one-sided deletion | No automatic resurrection is allowed by the retained-deletion rule | Report conflict when a transfer would resurrect the absent side |
+
+Both deletion options default to **off**. Download replacement is atomic; conflict handling is not an automatic merge. The chart summarizes path decisions, not every exception/stop branch; eligible baseline updates are saved at the end of the pass.
 
 ## Start here on Windows
 
@@ -75,6 +144,38 @@ At interactive setup and normal interactive startup, the application probes AWS 
 
 The sync engine uses boto3, not opposing `aws s3 sync --delete` commands. AWS CLI remains a checked prerequisite to satisfy the deployment requirement.
 
+### Installation and first run
+
+Recommended first test: keep the entire bundle together, install without startup, and use disposable data. Installation and AWS setup are separate steps.
+
+```mermaid
+flowchart TB
+    accTitle: First installation and interactive AWS CLI setup
+    accDescr: Build the full Windows bundle, install without startup, and launch setup. A missing AWS CLI requires approval and a verified MSI before setup can continue.
+    Build["build.bat on Windows<br/>Keep ALL of dist/SyncAgent"] --> Install["install.bat -NoStartup"]
+    Install --> Setup["SyncAgent.exe --setup"]
+    Setup --> CLI{"CLI ready?"}
+    CLI -->|"Yes"| Wizard["Choose auth + folder + S3 prefix<br/>Review options; deletions OFF"]
+    CLI -->|"No"| Approve{"Install CLI?"}
+    Approve -->|"No"| Stop["Stop setup<br/>No unattended CLI installation"]
+    Approve -->|"Yes"| Verify["Download MSI; verify signature + publisher<br/>Install; check CLI again"]
+    Verify -->|"Successful"| Wizard
+    Verify -->|"Failed"| Stop
+    Wizard --> Confirm{"Save?"}
+    Confirm -->|"No"| Cancel["Cancel without saving settings"]
+    Confirm -->|"Yes"| Ready["Settings saved<br/>Auth checks + start offered next"]
+    classDef process fill:#dbeafe,stroke:#1d4ed8,color:#172554
+    classDef decision fill:#fef3c7,stroke:#b45309,color:#78350f
+    classDef stop fill:#fee2e2,stroke:#b91c1c,color:#7f1d1d
+    classDef done fill:#dcfce7,stroke:#15803d,color:#14532d
+    class Build,Install,Setup,Wizard,Verify process
+    class CLI,Approve,Confirm decision
+    class Stop,Cancel stop
+    class Ready done
+```
+
+Declining the final settings save does not undo an AWS CLI installation you approved earlier. Access-key verification can contact STS before saving; SSO login is offered only after saving. Background mode never opens the installer or SSO browser. A verified STS identity still does **not** prove access to the chosen S3 prefix.
+
 ## Setup and reconfiguration
 
 The wizard collects workstation ID, authentication method, region, local folder, bucket/prefix and sync options. Authentication choices are:
@@ -99,6 +200,59 @@ SyncAgent.exe --reconfigure-all
 ```
 
 Partial reconfiguration offers identity, authentication/region, paths and sync/startup options. Cancel leaves the running agent and saved configuration untouched. Saving validates first, requests a cooperative stop, and holds the singleton lock while applying changes. Credentials/config/startup writes are rolled back on failure where possible; errors are reported. Restart is offered after a successful save. An active transfer that cannot stop in time prevents applying changes; do not force-kill it to continue.
+
+### Choose an authentication method
+
+Choose the credential source that is already provisioned for your environment. This is a choice map, not an automatic security ranking or an infrastructure-provisioning wizard.
+
+```mermaid
+flowchart LR
+    accTitle: Five supported authentication choices
+    accDescr: Four choices use named profiles. Workload mode instead uses the default SDK credential chain without an explicit profile; it is not role-only.
+    Choice{"Choose credential source"}
+    Choice --> Keys["Access keys<br/>Dedicated sync-agent profile<br/>Optional session token"]
+    Choice --> SSO["Browser SSO<br/>Existing Identity Center profile<br/>Explicit browser login"]
+    Choice --> Roles["Roles Anywhere<br/>Existing trusted helper profile<br/>Certificate setup required"]
+    Choice --> Other["Other existing profile<br/>Trusted SDK-supported provider<br/>For example: assume-role"]
+    Choice --> Workload["AWS workload / default chain<br/>No explicit profile<br/>NOT guaranteed role-only"]
+    Keys --> SDK["boto3<br/>credential resolution"]
+    SSO --> SDK
+    Roles --> SDK
+    Other --> SDK
+    Workload --> SDK
+    classDef process fill:#dbeafe,stroke:#1d4ed8,color:#172554
+    classDef decision fill:#fef3c7,stroke:#b45309,color:#78350f
+    class Choice,Workload decision
+    class Keys,SSO,Roles,Other,SDK process
+```
+
+Local profile validation does not execute a helper or authenticate to AWS. Actual credential resolution and `--check-auth` can execute a configured helper; SSO browser sign-in is explicit. Shared credentials stay outside `config.json`. See the method-specific caveats above before selecting a provider.
+
+### Reconfiguration without interrupting on cancel
+
+```mermaid
+flowchart TB
+    accTitle: Safe reconfiguration flow
+    accDescr: Review edits before confirmation. Cancel leaves the agent running. Saving requires cooperative stop and a maintenance lock, then applies changes with rollback on failure and offers restart only after success.
+    Edit["--reconfigure / --reconfigure-all<br/>Review staged edits"] --> Confirm{"Save edits?"}
+    Confirm -->|"No"| Cancel["Keep running agent<br/>Keep saved settings"]
+    Confirm -->|"Yes"| Validate["Validate settings + auth selection"]
+    Validate --> Stop["Request cooperative stop<br/>Acquire maintenance lock"]
+    Stop -->|"Cannot stop / lock"| Abort["Abort settings write<br/>Do not force-kill"]
+    Stop -->|"Lock acquired"| Apply["Apply config + startup<br/>Write staged keys if supplied"]
+    Apply -->|"Failure"| Rollback["Attempt rollback<br/>Report errors; inspect before retry"]
+    Apply -->|"Success"| Restart["Offer auth checks + restart<br/>Use status / logs to verify"]
+    classDef process fill:#dbeafe,stroke:#1d4ed8,color:#172554
+    classDef decision fill:#fef3c7,stroke:#b45309,color:#78350f
+    classDef stop fill:#fee2e2,stroke:#b91c1c,color:#7f1d1d
+    classDef done fill:#dcfce7,stroke:#15803d,color:#14532d
+    class Edit,Validate,Stop,Apply process
+    class Confirm,Rollback decision
+    class Abort stop
+    class Cancel,Restart done
+```
+
+Validation or stop failure prevents applying the edits. Rollback is best effort, not a guarantee that every external side effect can be undone. Changing the sync destination or authentication identity can require baseline/migration review; it is not permission to erase the old baseline.
 
 ## Commands
 
@@ -172,6 +326,32 @@ SyncAgent.exe --uninstall
 ```
 
 Alternatively, run the bundled `uninstall.bat`. Confirmation is required unless `-Yes` was explicitly supplied. The uninstaller requests a safe stop and removes the current user's application/startup registration. It preserves the sync folder, S3 objects, configuration, logs, baselines, AWS CLI and all shared AWS profiles. It does not uninstall legacy applications or remove their tasks/exclusions. Retained credentials and data must be reviewed and removed separately if appropriate.
+
+### What uninstall removes and keeps
+
+```mermaid
+flowchart TB
+    accTitle: Uninstall scope and data preservation
+    accDescr: After overlap checks and confirmation, verify the application tree and request a cooperative stop. On success remove only the owned app and current-user startup entry. Preserve local and S3 data, settings, baselines, AWS CLI and AWS profiles.
+    Request["SyncAgent.exe --uninstall<br/>or bundled uninstall.bat"] --> Scope["Check retained settings<br/>Refuse sync-folder overlap"]
+    Scope --> Confirm{"Remove app?"}
+    Confirm -->|"No"| Cancel["Cancel; leave agent installed"]
+    Confirm -->|"Yes"| Check["Verify owned app + plain directory tree<br/>Request cooperative stop if installed"]
+    Check -->|"Unsafe / stop failed"| Abort["Abort before removal<br/>Do not force-kill"]
+    Check -->|"Safe to continue"| Remove["Remove current-user startup entry<br/>Remove owned application bundle"]
+    Remove -->|"Success"| Kept["PRESERVED<br/>Local sync folder + S3 objects<br/>Config + logs + baselines<br/>AWS CLI + shared AWS profiles"]
+    Remove -->|"Failure"| Inspect["Report failure<br/>Inspect rollback / cleanup state"]
+    classDef process fill:#dbeafe,stroke:#1d4ed8,color:#172554
+    classDef decision fill:#fef3c7,stroke:#b45309,color:#78350f
+    classDef stop fill:#fee2e2,stroke:#b91c1c,color:#7f1d1d
+    classDef done fill:#dcfce7,stroke:#15803d,color:#14532d
+    class Request,Scope,Check,Remove process
+    class Confirm,Inspect decision
+    class Abort stop
+    class Cancel,Kept done
+```
+
+Scope/ownership checks fail closed; invalid settings can stop uninstall before confirmation. App/startup rollback is attempted if staging or startup removal fails; a later cleanup failure can still leave staged files requiring review. Preserved AWS credentials are **not revoked** by uninstalling the application.
 
 ## Development and validation
 
