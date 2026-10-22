@@ -5,6 +5,16 @@ getpass so typed values are never echoed or recorded.
 """
 from contextlib import contextmanager
 import getpass
+import sys
+
+# Redirected output on Windows defaults to the ANSI code page, where symbols such as
+# ◆ and ✔ raise UnicodeEncodeError (for example when the installer captures --status).
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        if _stream is not None and not _stream.isatty():
+            _stream.reconfigure(encoding='utf-8', errors='replace')
+    except (AttributeError, OSError, ValueError):
+        pass
 
 try:
     from rich.console import Console
@@ -100,7 +110,8 @@ def confirm(prompt, default=True):
         if console is None:
             value = input(f'{prompt} [{hint}]: ').strip().lower()
         else:
-            value = console.input(f'  [bold]?[/] {_escape(prompt)} [dim][{hint}][/]: ').strip().lower()
+            # Escape the hint: rich would otherwise parse "[y/N]" as a markup tag and hide it.
+            value = console.input(f'  [bold]?[/] {_escape(prompt)} [dim]{_escape(f"[{hint}]")}[/]: ').strip().lower()
         if not value:
             return default
         if value in ('y', 'yes'):

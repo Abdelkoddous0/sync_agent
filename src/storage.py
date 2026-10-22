@@ -16,8 +16,13 @@ class S3Store:
         if client is None:
             import boto3
             from botocore.config import Config
+            from botocore.exceptions import ProfileNotFound
             from authentication import session_kwargs
-            session = boto3.Session(**session_kwargs(cfg))
+            try:
+                session = boto3.Session(**session_kwargs(cfg))
+            except ProfileNotFound:
+                raise ValueError(f'AWS profile "{cfg.get("aws_profile")}" was not found. '
+                                 'Run SyncAgent.exe --reconfigure to choose a profile.') from None
             client = session.client('s3', config=Config(
                 connect_timeout=min(10,self.timeout), read_timeout=min(20,self.timeout),
                 retries={'mode':'standard','total_max_attempts':cfg.get('max_retries',3)},
@@ -37,19 +42,22 @@ class S3Store:
     def download(self, name, target, expected, stop):
         response = self.client.get_object(Bucket=self.bucket, Key=self.prefix+name, IfMatch=expected)
         body = response['Body']
+        # Stall limit per block, not for the whole object: a large file on a slow but
+        # working connection must not fail on every pass.
         deadline = time.monotonic() + self.timeout
         size = 0
         try:
             while True:
                 if stop.is_set():
                     raise InterruptedError('Stopping download')
-                if time.monotonic() > deadline:
-                    raise TimeoutError('Download transfer deadline exceeded')
                 block = body.read(1024*1024)
+                if time.monotonic() > deadline:
+                    raise TimeoutError('Download stalled beyond the transfer timeout')
                 if not block:
                     break
                 target.write(block)
                 size += len(block)
+                deadline = time.monotonic() + self.timeout
             if 'ContentLength' in response and size != response['ContentLength']:
                 raise IOError('Incomplete S3 response')
         finally:

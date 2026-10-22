@@ -11,7 +11,7 @@ from unittest.mock import Mock, patch
 class SetupTests(unittest.TestCase):
     def test_save_credentials_preserves_other_profiles_without_command_arguments(self):
         import ast
-        source = Path(__file__).resolve().parents[1]/'helpers.py'
+        source = Path(__file__).resolve().parents[1]/'src'/'helpers.py'
         self.assertIn('save_credentials', [n.name for n in ast.parse(source.read_text()).body if isinstance(n,ast.FunctionDef)])
         import helpers
         with tempfile.TemporaryDirectory() as folder:

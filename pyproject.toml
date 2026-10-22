@@ -1,0 +1,13 @@
+[project]
+name = "sync-agent"
+version = "1.1.0"
+description = "Windows 10/11 tray application that safely synchronizes a local folder with an AWS S3 prefix."
+readme = "README.md"
+requires-python = ">=3.10"
+
+# Dependencies live in requirements.txt / requirements-dev.txt; the application
+# is distributed as a PyInstaller build (build.bat), not as a pip package.
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]

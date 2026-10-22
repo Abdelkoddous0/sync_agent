@@ -1,2 +1,0 @@
-# Compatibility with the historical misspelled filename.
--r requirements.txt

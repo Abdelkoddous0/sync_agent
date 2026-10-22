@@ -1,4 +1,6 @@
 name: Windows distribution
+# Manual only, to avoid consuming Actions minutes on every push:
+# Actions tab -> "Windows distribution" -> Run workflow.
 on: [workflow_dispatch]
 jobs:
   test-build:
@@ -14,7 +16,7 @@ jobs:
           foreach ($file in @('ensure_aws_cli.ps1', 'install.ps1', 'uninstall.ps1')) {
             $tokens = $null
             $errors = $null
-            [void][System.Management.Automation.Language.Parser]::ParseFile((Join-Path $pwd $file), [ref]$tokens, [ref]$errors)
+            [void][System.Management.Automation.Language.Parser]::ParseFile((Join-Path $pwd "scripts\$file"), [ref]$tokens, [ref]$errors)
             if ($errors.Count) { $errors | Format-List; throw "PowerShell parse failed: $file" }
           }
       - name: Offline unit tests and compile
@@ -24,12 +26,12 @@ jobs:
           if errorlevel 1 exit /b 1
           python -m pytest tests -q
           if errorlevel 1 exit /b 1
-          python -m compileall -q -x "(\.venv|build|dist)" .
+          python -m compileall -q src tests
           if errorlevel 1 exit /b 1
-      - name: Build only unified application
+      - name: Build application and one-file installer
         shell: cmd
         run: build.bat
-      - name: Verify packaged executable (no setup or cloud)
+      - name: Verify packaged executables (no setup or cloud)
         shell: powershell
         run: |
           & .\dist\SyncAgent\SyncAgent.exe --help

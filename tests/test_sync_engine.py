@@ -1,7 +1,8 @@
 import hashlib
 from pathlib import Path
 import sys
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+import pytest
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'src'))
 
 class FakeStore:
     def __init__(self, files=None):
@@ -150,7 +151,10 @@ def test_symlink_is_never_followed(tmp_path):
     store=FakeStore({'a':b'remote'})
     engine=make_engine(tmp_path,store)
     outside=tmp_path/'outside'; outside.write_bytes(b'private')
-    (engine.root/'a').symlink_to(outside)
+    try:
+        (engine.root/'a').symlink_to(outside)
+    except OSError:
+        pytest.skip('Symlink creation requires platform privileges')
     assert engine.sync()['errors']
     assert outside.read_bytes()==b'private'
     assert not store.writes

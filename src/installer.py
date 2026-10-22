@@ -29,7 +29,7 @@ def payload_dir(source=None):
         return Path(source).resolve()
     if hasattr(sys, '_MEIPASS'):
         return Path(sys._MEIPASS) / 'payload'
-    return Path(__file__).resolve().parent / 'dist' / 'SyncAgent'
+    return Path(__file__).resolve().parents[1] / 'dist' / 'SyncAgent'
 
 
 def check_payload(path):
@@ -128,7 +128,7 @@ def install(args):
     elif previous:
         info('Existing settings kept.')
         if args.yes or confirm('Start Sync Agent now?', default=True):
-            subprocess.Popen([exe, '--background'], close_fds=True)
+            subprocess.Popen([exe, '--background'], **config.background_popen_kwargs())
             ok('Start requested. Sync Agent runs in the system tray.')
     elif not args.no_configure and not args.yes:
         section('Configure')
@@ -138,8 +138,9 @@ def install(args):
         info('Configure later with: "' + exe + '" --setup')
 
     section('Done')
-    key_values([('Status', f'"{exe}" --status'), ('Reconfigure', f'"{exe}" --reconfigure'),
-                ('Uninstall', f'"{exe}" --uninstall')])
+    key_values([('Start Menu', 'Sync Agent (starts the tray agent, or setup if not configured)'),
+                ('Status', f'"{exe}" --status'), ('Reconfigure', f'"{exe}" --reconfigure'),
+                ('Uninstall', f'Settings > Apps > Installed apps > Sync Agent, or "{exe}" --uninstall')])
     return 0
 
 

@@ -22,6 +22,16 @@ def default_workstation_id():
     return re.sub(r'[^A-Za-z0-9_-]+', '-', name).strip('-')[:64] or 'workstation'
 
 
+def ask_valid(prompt, default, check):
+    """Re-ask until check(value) accepts it, so one typo never discards earlier answers."""
+    while True:
+        value = ask(prompt, default)
+        try:
+            return check(value)
+        except ValueError as exc:
+            err(str(exc))
+
+
 def edit_identity(cfg):
     while True:
         value = ask('Workstation ID (letters, digits, underscore, hyphen)',
@@ -30,6 +40,11 @@ def edit_identity(cfg):
             cfg['workstation_id'] = value
             return
         err('Use 1–64 ASCII letters, digits, underscores or hyphens.')
+
+
+def list_profiles():
+    from authentication import list_profiles as profiles
+    return profiles()
 
 
 def validate_auth_profile(cfg):
@@ -48,7 +63,7 @@ def verify_identity(cfg):
 
 
 def edit_credentials(cfg):
-    cfg['region'] = ask('AWS region', cfg.get('region','eu-central-1'))
+    cfg['region'] = ask_valid('AWS region', cfg.get('region','eu-central-1'), config.check_region)
     choices = {'1':'access_keys','2':'sso','3':'roles_anywhere','4':'workload_role','5':'profile'}
     current = cfg.get('auth_method','access_keys')
     default = next((key for key,value in choices.items() if value == current),'1')
@@ -80,7 +95,20 @@ def edit_credentials(cfg):
             warn('The selected credential_process may execute a local program when credentials are requested.')
         else:
             warn('Select a trusted preconfigured AWS profile; its credential process may execute local programs.')
-        cfg['aws_profile'] = ask('Existing AWS profile name',cfg.get('aws_profile') or config.AWS_PROFILE)
+        profiles = [name for name in list_profiles() if name != config.AWS_PROFILE or method == 'profile']
+        if profiles:
+            info('Profiles found on this computer: ' + ', '.join(profiles[:15]))
+        while True:
+            cfg['aws_profile'] = ask('Existing AWS profile name',cfg.get('aws_profile') or config.AWS_PROFILE)
+            try:
+                validate_auth_profile(cfg)
+                break
+            except ValueError as exc:
+                err(str(exc))
+                if not confirm('Enter a different profile name?', default=True):
+                    raise
+        info('No AWS profile files changed. Identity verification is offered only after saving.')
+        return None
     validate_auth_profile(cfg)
     info('No AWS profile files changed. Identity verification is offered only after saving.')
     return None
@@ -88,28 +116,40 @@ def edit_credentials(cfg):
 
 def _edit_access_credentials(cfg):
     info('Use the dedicated sync-agent profile. Credentials are not saved until final confirmation.')
-    if not confirm('Enter new AWS access credentials?', default=False):
+    # First installation: there is no profile to reuse, so entering keys is the useful default.
+    has_profile = config.AWS_PROFILE in list_profiles()
+    if not confirm('Enter new AWS access credentials?', default=not has_profile):
         valid, message = verify_aws(region=cfg['region'])
         info(message)
         if not valid and not confirm('Continue with existing profile without successful verification?',default=False):
             raise ValueError('Credential verification failed. Configure the sync-agent profile and retry.')
         return None
-    access = ask('AWS access key ID')
-    secret = ask('AWS secret access key', password=True)
-    token = ask('Session token (blank for long-lived credentials)', password=True)
-    if not access or not secret:
-        raise ValueError('Both access key and secret key are required.')
-    valid, message = verify_aws(access,secret,cfg['region'],token)
-    info(message)
-    if not valid and not confirm('Save unverified credentials anyway?',default=False):
+    while True:
+        access = ask('AWS access key ID')
+        secret = ask('AWS secret access key', password=True)
+        token = ask('Session token (blank for long-lived credentials)', password=True)
+        if not access or not secret:
+            err('Both access key and secret key are required.')
+            continue
+        valid, message = verify_aws(access,secret,cfg['region'],token)
+        (ok if valid else err)(message)
+        if valid:
+            return (access,secret,cfg['region'],token)
+        if confirm('Re-enter the credentials?', default=True):
+            continue
+        if confirm('Save unverified credentials anyway?',default=False):
+            return (access,secret,cfg['region'],token)
         raise ValueError('Credentials were not accepted; no settings saved.')
-    return (access,secret,cfg['region'],token)
 
 
 def edit_paths(cfg):
-    cfg['local_path'] = ask('Absolute local sync folder', cfg.get('local_path',str(Path.home()/'Sync Agent Data')))
-    cfg['s3_bucket'] = ask('S3 bucket (name only)',cfg.get('s3_bucket',''))
-    cfg['s3_prefix'] = ask('S3 prefix',cfg.get('s3_prefix',f"workstations/{cfg.get('workstation_id','workstation')}"))
+    cfg['local_path'] = ask_valid('Absolute local sync folder (created if missing)',
+                                  cfg.get('local_path',str(Path.home()/'Sync Agent Data')),
+                                  lambda value: config.check_local_path(value.strip().strip('"')))
+    cfg['s3_bucket'] = ask_valid('S3 bucket (name only)',cfg.get('s3_bucket',''),
+                                 lambda value: config.check_bucket(value.removeprefix('s3://').strip('/')))
+    cfg['s3_prefix'] = ask_valid('S3 prefix',cfg.get('s3_prefix',f"workstations/{cfg.get('workstation_id','workstation')}"),
+                                 lambda value: config.check_prefix(value.strip('/')))
 
 
 def edit_options(cfg):
@@ -228,8 +268,8 @@ def finish_settings(cfg, credentials):
             warn('Settings are saved, but the agent was not started. Fix authentication before starting it.')
             return True
     if confirm('Start Sync Agent now?',default=True):
-        subprocess.Popen(config.launch_command('--background'),close_fds=True)
-        ok('Start requested. Sync Agent runs in the system tray.')
+        subprocess.Popen(config.launch_command('--background'), **config.background_popen_kwargs())
+        ok('Start requested. Sync Agent runs in the system tray (it may be under the ^ arrow).')
         info('Use --status and --logs to confirm runtime health.')
     return True
 
@@ -252,11 +292,18 @@ def run_import(path, assume_yes=False, start=None):
     apply_settings(cfg)
     ok(f'Settings saved to {config.CONFIG_PATH}.')
     if cfg.get('auth_method') == 'sso':
-        info('Sign in with SyncAgent.exe --login before the first sync.')
+        if not assume_yes and confirm('Sign in to the selected SSO profile in your browser now?', default=True):
+            try:
+                login_sso(cfg)
+                ok('SSO sign-in completed.')
+            except RuntimeError as exc:
+                warn(str(exc))
+        else:
+            info('Sign in with SyncAgent.exe --login before the first sync.')
     if start is None:
         start = assume_yes or confirm('Start Sync Agent now?', default=True)
     if start:
-        subprocess.Popen(config.launch_command('--background'), close_fds=True)
+        subprocess.Popen(config.launch_command('--background'), **config.background_popen_kwargs())
         ok('Start requested. Sync Agent runs in the system tray.')
     return True
 

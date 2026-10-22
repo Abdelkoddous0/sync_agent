@@ -3,15 +3,13 @@ import json
 import os
 from pathlib import Path
 import subprocess
-import sys
 import time
 
 import config
 
 
 def resource_file(name):
-    root = Path(getattr(sys, '_MEIPASS', config.BASE_DIR))
-    path = root / name
+    path = config.SCRIPTS_DIR / name
     if not path.is_file():
         raise FileNotFoundError(f'Missing packaged resource: {name}. Rebuild or reinstall Sync Agent.')
     return path
@@ -24,7 +22,13 @@ def cmd_status():
         info(f'Sync Agent is not configured. Expected: {config.CONFIG_PATH}')
         info('Run SyncAgent.exe --setup to configure it.')
         return 0
-    cfg = config.load_config()
+    try:
+        cfg = config.load_config()
+    except ValueError as exc:
+        # Report rather than fail: upgrades run --status and must not be blocked by old settings.
+        err(f'Configuration needs repair: {exc}')
+        info('Run SyncAgent.exe --setup to review and save valid settings.')
+        return 0
     from runtime import is_running
     running = is_running()
     rows = [('Agent', badge('RUNNING' if running else 'STOPPED', running)),

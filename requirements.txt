@@ -1,4 +1,4 @@
-# Application and Windows distribution dependencies (Python 3.10+).
+# Runtime dependencies of the Sync Agent application (Python 3.10+, 64-bit Windows).
 rich>=13,<15
 watchdog>=4,<7
 pystray>=0.19,<1
@@ -7,4 +7,3 @@ plyer>=2.1,<3
 # Conservative minimum verified with real S3 conditional-operation models and Stubber.
 boto3>=1.43.117,<2
 botocore>=1.43.117,<2
-pyinstaller>=6,<7

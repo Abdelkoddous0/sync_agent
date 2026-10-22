@@ -4,7 +4,7 @@ import subprocess
 import sys
 import threading
 import time
-sys.path.insert(0,str(Path(__file__).resolve().parents[1]))
+sys.path.insert(0,str(Path(__file__).resolve().parents[1]/'src'))
 
 def test_runtime_singleton_stop_and_stale_files(tmp_path):
     import runtime
@@ -66,7 +66,7 @@ def test_runtime_cross_process_abrupt_exit_releases_lock(tmp_path):
     import runtime
     code='import runtime,sys; g=runtime.RuntimeGuard(sys.argv[1]); assert g.acquire(); print("ready",flush=True); sys.stdin.readline()'
     proc=subprocess.Popen([sys.executable,'-c',code,str(tmp_path)],stdin=subprocess.PIPE,
-                          stdout=subprocess.PIPE,text=True)
+                          stdout=subprocess.PIPE,text=True,cwd=Path(__file__).resolve().parents[1]/'src')
     try:
         assert proc.stdout.readline().strip()=='ready'
         assert runtime.is_running(tmp_path)

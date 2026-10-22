@@ -50,6 +50,12 @@ def run_agent(cfg):
                 logging.exception('Could not persist status')
             return report
         worker.sync = reported_sync
+        try:
+            # Replace any earlier "Startup failed" report before the first pass completes.
+            sync_engine.atomic_json(config.DATA_DIR/'status.json',
+                                    {'status':'Starting','conflicts':[],'errors':[],'changed':[]})
+        except OSError:
+            logging.exception('Could not persist status')
         observer = Observer()
         observer.schedule(SyncHandler(worker.request_sync,cfg),path=cfg['local_path'],
                           recursive=cfg.get('recursive',True))

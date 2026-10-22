@@ -3,6 +3,8 @@
 param([switch]$Install)
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
+# The Windows PowerShell 5.1 progress bar slows Invoke-WebRequest by an order of magnitude.
+$ProgressPreference = 'SilentlyContinue'
 
 function Find-AwsCli {
     $candidates = @()
@@ -50,6 +52,7 @@ try {
     New-Item -ItemType Directory -Path $tempDir | Out-Null
     try {
         $msi = Join-Path $tempDir 'AWSCLIV2-User.msi'
+        Write-Host 'Downloading the official AWS CLI installer (about 50 MB)...'
         [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
         Invoke-WebRequest -UseBasicParsing -Uri 'https://awscli.amazonaws.com/AWSCLIV2-User.msi' -OutFile $msi -MaximumRedirection 0 -TimeoutSec 180
         $signature = Get-AuthenticodeSignature -LiteralPath $msi
@@ -58,7 +61,10 @@ try {
             throw 'AWS installer signature is not Valid with an Amazon publisher; refusing installation.'
         }
         $msiexec = Join-Path $env:SystemRoot 'System32\msiexec.exe'
+        Write-Host 'Installing AWS CLI for the current user (this can take a few minutes)...'
         $process = Start-Process -FilePath $msiexec -ArgumentList @('/i', ('"' + $msi + '"'), '/qn', '/norestart') -PassThru
+        # Windows PowerShell 5.1 reports a $null ExitCode unless the handle is opened before exit.
+        $null = $process.Handle
         if (-not $process.WaitForExit(600000)) { throw 'AWS MSI timed out; Windows Installer may still be running. Do not retry until it completes.' }
         if ($process.ExitCode -notin @(0, 3010, 1641)) { throw "AWS MSI failed with exit code $($process.ExitCode)." }
         if ($process.ExitCode -in @(3010, 1641)) { Write-Warning 'AWS installer reports a restart is required.' }

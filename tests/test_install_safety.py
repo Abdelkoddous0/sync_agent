@@ -28,12 +28,13 @@ def fixture_tree(tmp_path,marked=False):
     return app,source
 
 
-def run_script(tmp_path,name,source=None,fail_registry=False):
-    harness=tmp_path/'harness.ps1'
+def run_script(tmp_path,name,source=None,fail_registry=False,harness_dir=None):
+    # Windows PowerShell 5.1 cannot run a script from a path longer than MAX_PATH.
+    harness=(harness_dir or tmp_path)/'harness.ps1'
     prelude='''$ErrorActionPreference='Stop'
 $global:registryValue='old-startup-value'
 function Start-Process { param($FilePath,$ArgumentList,[switch]$PassThru,[switch]$NoNewWindow)
-    $p=[pscustomobject]@{ExitCode=0}
+    $p=[pscustomobject]@{ExitCode=0;Handle=1}
     $p | Add-Member ScriptMethod WaitForExit { param($Timeout) return $true }
     return $p
 }
@@ -49,7 +50,7 @@ function New-Item {
     Microsoft.PowerShell.Management\\New-Item @PSBoundParameters
 }
 '''
-    command='& '+literal(ROOT/name)+' -Yes'
+    command='& '+literal(ROOT/'scripts'/name)+' -Yes'
     if source: command+=' -SourceDir '+literal(source)
     harness.write_text(prelude+command+'\n',encoding='utf-8')
     env={**os.environ,'LOCALAPPDATA':str(tmp_path/'profile'),'FAIL_REGISTRY':'1' if fail_registry else '0'}
@@ -91,7 +92,7 @@ def test_lifecycle_refuses_sync_folder_overlap(tmp_path,script,relation):
 def test_installer_rejects_overlong_startup_command(tmp_path):
     deep=tmp_path/('a'*100)/('b'*100)
     app,source=fixture_tree(deep,marked=True)
-    result=run_script(deep,'install.ps1',source)
+    result=run_script(deep,'install.ps1',source,harness_dir=tmp_path)
     assert result.returncode!=0,result.stdout+result.stderr
     assert '260' in result.stdout+result.stderr
     assert (app/'keep.txt').exists()

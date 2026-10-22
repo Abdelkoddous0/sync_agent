@@ -14,6 +14,8 @@ APP_NAME = 'Sync Agent'
 APP_ID = 'SyncAgent'
 AWS_PROFILE = 'sync-agent'
 BASE_DIR = Path(sys.executable if getattr(sys, 'frozen', False) else __file__).resolve().parent
+# Lifecycle PowerShell scripts: bundled beside the code when frozen, scripts/ in a checkout.
+SCRIPTS_DIR = Path(sys._MEIPASS) if hasattr(sys, '_MEIPASS') else BASE_DIR.parent / 'scripts'
 DATA_DIR = Path(os.environ.get('LOCALAPPDATA', str(Path.home() / '.local' / 'share'))) / APP_ID
 CONFIG_PATH = DATA_DIR / 'config.json'
 LOG_DIR = DATA_DIR / 'logs'
@@ -37,6 +39,58 @@ def validate_auth_selection(data):
     return method, profile
 
 
+def check_workstation_id(ws):
+    if not isinstance(ws, str) or not re.fullmatch(r'[A-Za-z0-9_-]{1,64}', ws):
+        raise ValueError('Workstation ID: use 1–64 ASCII letters, digits, underscores or hyphens.')
+    return ws
+
+
+def check_local_path(local):
+    """Return the normalized absolute sync folder; raise ValueError with a user-facing reason."""
+    if not isinstance(local, str) or not local or '\x00' in local:
+        raise ValueError('Choose an absolute local folder.')
+    if not Path(local).is_absolute() and not ntpath.isabs(local):
+        raise ValueError('Local folder must be an absolute path, for example C:\\Users\\you\\Sync Agent Data.')
+    if os.name == 'nt' and not ntpath.splitdrive(local)[0]:
+        raise ValueError('Local folder must include a drive or UNC share.')
+    if not Path(local).is_absolute():
+        return ntpath.normpath(local)
+    candidate = Path(local).absolute()
+    for part in (candidate, *candidate.parents):
+        if part.is_symlink() or (part.exists() and getattr(part.lstat(), 'st_file_attributes', 0) & 0x400):
+            raise ValueError('Sync folder must not contain symlinks or reparse points.')
+    if candidate.exists() and not candidate.is_dir():
+        raise ValueError('Local folder path points to a file, not a folder.')
+    root = Path(local).resolve()
+    for protected in (DATA_DIR.resolve(), BASE_DIR.resolve(), PF_DIR.resolve()):
+        if root == protected or root in protected.parents or protected in root.parents:
+            raise ValueError('Sync folder must not overlap application or configuration folders '
+                             '(for example, use a subfolder of your user folder, not the user folder itself).')
+    return str(candidate)
+
+
+def check_bucket(bucket):
+    if not isinstance(bucket, str) or not re.fullmatch(r'[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]', bucket) or '..' in bucket or '.-' in bucket or '-.' in bucket:
+        raise ValueError('Enter a valid S3 bucket name: 3–63 lowercase letters, digits, dots or hyphens (not an s3:// URL).')
+    try:
+        ipaddress.ip_address(bucket)
+    except ValueError:
+        return bucket
+    raise ValueError('S3 bucket must not be an IP address.')
+
+
+def check_prefix(prefix):
+    if not isinstance(prefix, str) or not prefix or prefix != prefix.strip('/') or '\\' in prefix or any(p in ('', '.', '..') for p in prefix.split('/')) or any(ord(c) < 32 for c in prefix):
+        raise ValueError('S3 prefix must be nonempty, without leading/trailing slash, empty or dot components.')
+    return prefix
+
+
+def check_region(region):
+    if not isinstance(region, str) or not re.fullmatch(r'[a-z]{2}(?:-[a-z0-9]+)+-\d+', region):
+        raise ValueError('Enter an AWS region such as eu-central-1.')
+    return region
+
+
 def validate_config(data: dict) -> dict:
     if not isinstance(data, dict):
         raise ValueError('Configuration must be a JSON object.')
@@ -45,42 +99,11 @@ def validate_config(data: dict) -> dict:
                'transfer_timeout', 'notifications', 'recursive', 'sync_from_s3',
                'delete_on_s3', 'delete_local', 'autostart', 'exclude_patterns'}
     result = {key: value for key, value in data.items() if key in allowed}
-    ws = result.get('workstation_id', '')
-    if not isinstance(ws, str) or not re.fullmatch(r'[A-Za-z0-9_-]{1,64}', ws):
-        raise ValueError('Workstation ID: use 1–64 ASCII letters, digits, underscores or hyphens.')
-    local = result.get('local_path', '')
-    if not isinstance(local, str) or not local or '\x00' in local:
-        raise ValueError('Choose an absolute local folder.')
-    if not Path(local).is_absolute() and not ntpath.isabs(local):
-        raise ValueError('Local folder must be an absolute path.')
-    if os.name == 'nt' and not ntpath.splitdrive(local)[0]:
-        raise ValueError('Local folder must include a drive or UNC share.')
-    if Path(local).is_absolute():
-        candidate = Path(local).absolute()
-        for part in (candidate, *candidate.parents):
-            if part.is_symlink() or (part.exists() and getattr(part.lstat(), 'st_file_attributes', 0) & 0x400):
-                raise ValueError('Sync folder must not contain symlinks or reparse points.')
-    result['local_path'] = str(Path(local).absolute()) if Path(local).is_absolute() else ntpath.normpath(local)
-    if Path(local).is_absolute():
-        root = Path(local).resolve()
-        for protected in (DATA_DIR.resolve(), BASE_DIR.resolve(), PF_DIR.resolve()):
-            if root == protected or root in protected.parents or protected in root.parents:
-                raise ValueError('Sync folder must not overlap application or configuration folders.')
-    bucket = result.get('s3_bucket', '')
-    if not isinstance(bucket, str) or not re.fullmatch(r'[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]', bucket) or '..' in bucket or '.-' in bucket or '-.' in bucket:
-        raise ValueError('Enter a valid S3 bucket name (not an s3:// URL).')
-    try:
-        ipaddress.ip_address(bucket)
-    except ValueError:
-        pass
-    else:
-        raise ValueError('S3 bucket must not be an IP address.')
-    prefix = result.get('s3_prefix', '')
-    if not isinstance(prefix, str) or not prefix or prefix != prefix.strip('/') or '\\' in prefix or any(p in ('', '.', '..') for p in prefix.split('/')) or any(ord(c) < 32 for c in prefix):
-        raise ValueError('S3 prefix must be nonempty, without leading/trailing slash, empty or dot components.')
-    region = result.setdefault('region', 'eu-central-1')
-    if not isinstance(region, str) or not re.fullmatch(r'[a-z]{2}(?:-[a-z0-9]+)+-\d+', region):
-        raise ValueError('Enter an AWS region such as eu-central-1.')
+    ws = check_workstation_id(result.get('workstation_id', ''))
+    result['local_path'] = check_local_path(result.get('local_path', ''))
+    check_bucket(result.get('s3_bucket', ''))
+    check_prefix(result.get('s3_prefix', ''))
+    check_region(result.setdefault('region', 'eu-central-1'))
     result['auth_method'], result['aws_profile'] = validate_auth_selection(result)
     for key, default, low, high in [('debounce_secs',5,0,3600), ('max_retries',3,1,10), ('poll_interval',30,5,86400), ('transfer_timeout',120,10,3600)]:
         value = result.setdefault(key, default)
@@ -125,6 +148,72 @@ def launch_command(*args) -> list[str]:
     return [sys.executable, str(BASE_DIR / 'main.py'), *args]
 
 
+DETACHED_ENV = 'SYNC_AGENT_DETACHED'
+
+
+def background_popen_kwargs() -> dict:
+    """Popen options that start the tray agent with no console window of its own.
+
+    A child sharing the caller's console would hide that window (the installer or
+    setup wizard) when it calls hide_console(); on Windows 11 the console may be a
+    Windows Terminal tab that hiding cannot remove at all.
+    """
+    flags = getattr(subprocess, 'CREATE_NO_WINDOW', 0) | getattr(subprocess, 'CREATE_NEW_PROCESS_GROUP', 0)
+    return dict(creationflags=flags, close_fds=True, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL, env={**os.environ, DETACHED_ENV: '1'})
+
+
+def start_background():
+    return subprocess.Popen(launch_command('--background'), **background_popen_kwargs())
+
+
+UNINSTALL_KEY = r'Software\Microsoft\Windows\CurrentVersion\Uninstall\SyncAgent'
+
+
+def shortcut_path() -> Path:
+    appdata = os.environ.get('APPDATA') or str(Path.home() / 'AppData' / 'Roaming')
+    return Path(appdata) / 'Microsoft' / 'Windows' / 'Start Menu' / 'Programs' / f'{APP_NAME}.lnk'
+
+
+def register_shell():
+    """Start Menu shortcut and per-user "Installed apps" entry; no administrator rights."""
+    if os.name != 'nt' or not getattr(sys, 'frozen', False):
+        raise RuntimeError('Shell integration is available only for the installed Windows application.')
+    import winreg
+    from ui import VERSION
+    exe = Path(sys.executable)
+    link = shortcut_path()
+    link.parent.mkdir(parents=True, exist_ok=True)
+    # Values travel in environment variables, never interpolated into the script text.
+    script = ('$s=(New-Object -ComObject WScript.Shell).CreateShortcut($env:SA_LINK);'
+              '$s.TargetPath=$env:SA_EXE;$s.WorkingDirectory=$env:SA_DIR;'
+              '$s.IconLocation=$env:SA_EXE+",0";'
+              '$s.Description="Start Sync Agent, or set it up on first use";$s.Save()')
+    powershell = Path(os.environ.get('SystemRoot', r'C:\Windows')) / 'System32' / 'WindowsPowerShell' / 'v1.0' / 'powershell.exe'
+    subprocess.run([str(powershell), '-NoProfile', '-NonInteractive', '-Command', script], check=True, timeout=60,
+                   capture_output=True, creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0),
+                   env={**os.environ, 'SA_LINK': str(link), 'SA_EXE': str(exe), 'SA_DIR': str(exe.parent)})
+    values = {'DisplayName': APP_NAME, 'DisplayVersion': VERSION, 'Publisher': APP_NAME,
+              'InstallLocation': str(exe.parent), 'DisplayIcon': f'"{exe}",0',
+              'UninstallString': subprocess.list2cmdline([str(exe), '--uninstall'])}
+    with winreg.CreateKey(winreg.HKEY_CURRENT_USER, UNINSTALL_KEY) as key:
+        for name, value in values.items():
+            winreg.SetValueEx(key, name, 0, winreg.REG_SZ, value)
+        for name in ('NoModify', 'NoRepair'):
+            winreg.SetValueEx(key, name, 0, winreg.REG_DWORD, 1)
+
+
+def unregister_shell():
+    if os.name != 'nt':
+        return
+    import winreg
+    shortcut_path().unlink(missing_ok=True)
+    try:
+        winreg.DeleteKey(winreg.HKEY_CURRENT_USER, UNINSTALL_KEY)
+    except FileNotFoundError:
+        pass
+
+
 def register_startup(ws_id: str = '', exe_path: str = '') -> bool:
     """Current-user Run entry: no shell, VBS, elevation, or per-ID task."""
     if os.name != 'nt':
@@ -150,6 +239,10 @@ def remove_startup(ws_id: str = ''):
             winreg.DeleteValue(key, APP_ID)
     except FileNotFoundError:
         pass
+
+
+def console_window_visible() -> bool:
+    return os.name == 'nt' and bool(ctypes.windll.kernel32.GetConsoleWindow())
 
 
 def hide_console():

@@ -57,8 +57,8 @@ def ensure_aws_cli(interactive: bool = True) -> str:
         raise RuntimeError('AWS CLI installation cancelled.') from exc
     if accepted not in ('y', 'yes'):
         raise RuntimeError('AWS CLI installation cancelled.')
-    bundle = Path(getattr(sys, '_MEIPASS', Path(__file__).resolve().parent))
-    script = bundle / 'ensure_aws_cli.ps1'
+    from config import SCRIPTS_DIR
+    script = SCRIPTS_DIR / 'ensure_aws_cli.ps1'
     if not script.is_file():
         raise RuntimeError(f'AWS CLI installer script missing: {script}')
     powershell = Path(os.environ.get('SystemRoot', r'C:\Windows')) / 'System32/WindowsPowerShell/v1.0/powershell.exe'

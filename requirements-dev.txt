@@ -1,2 +1,4 @@
+# Build and test tools; build.bat installs this file.
 -r requirements.txt
 pytest>=8,<10
+pyinstaller>=6,<7

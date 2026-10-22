@@ -11,6 +11,33 @@ def session_kwargs(cfg):
     return kwargs
 
 
+def _shared_config():
+    """Merge ~/.aws/config and ~/.aws/credentials the way botocore does, from files only.
+
+    A botocore Session is deliberately not constructed: on Windows it probes the OS
+    version by spawning a process, which this local-only check must never do.
+    """
+    import os
+    from botocore import configloader
+    config_file = os.environ.get('AWS_CONFIG_FILE', '~/.aws/config')
+    credentials_file = os.environ.get('AWS_SHARED_CREDENTIALS_FILE', '~/.aws/credentials')
+    try:
+        full = configloader.build_profile_map(configloader.raw_config_parse(config_file))
+        for name, values in configloader.raw_config_parse(credentials_file).items():
+            full['profiles'].setdefault(name, {}).update(values)
+    except Exception:
+        raise ValueError('Cannot read AWS profile configuration; repair the shared AWS files.') from None
+    return full
+
+
+def list_profiles():
+    """Profile names from the shared AWS files; empty when they are missing or unreadable."""
+    try:
+        return sorted(_shared_config().get('profiles', {}))
+    except ValueError:
+        return []
+
+
 def validate_auth_profile(cfg):
     """Inspect merged local AWS files without resolving credentials or running helpers.
 
@@ -20,14 +47,12 @@ def validate_auth_profile(cfg):
     method, profile = validate_auth_selection(cfg)
     if method == 'workload_role':
         return
-    import botocore.session
-    try:
-        full = botocore.session.Session().full_config
-    except Exception:
-        raise ValueError('Cannot read AWS profile configuration; repair the shared AWS files.') from None
+    full = _shared_config()
     selected = full.get('profiles', {}).get(profile)
     if selected is None:
-        raise ValueError('Selected AWS profile does not exist. Configure it before setup.')
+        hint = (f' Create it with: aws configure sso --profile {profile}' if method == 'sso'
+                else ' Configure it in your AWS config/credentials files first.')
+        raise ValueError(f'AWS profile "{profile}" does not exist.' + hint)
     static = {'aws_access_key_id', 'aws_secret_access_key', 'aws_session_token', 'aws_security_token'}
     competing = {'role_arn', 'source_profile', 'credential_source', 'web_identity_token_file'}
     if method == 'sso':

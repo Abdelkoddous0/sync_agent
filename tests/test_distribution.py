@@ -10,7 +10,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT))
+sys.path.insert(0, str(ROOT / 'src'))
 
 
 class AwsDiscoveryTests(unittest.TestCase):
@@ -40,7 +40,7 @@ PWSH = os.environ.get('SYNC_AGENT_TEST_PWSH') or shutil.which('pwsh') or shutil.
 class PowerShellBootstrapTests(unittest.TestCase):
     def bootstrap(self, status='Valid', publisher='Amazon Web Services, Inc.', code=0, reprobe=True):
         # Real bootstrap body; mocks only network, signature and process boundaries.
-        source = (ROOT / 'ensure_aws_cli.ps1').read_text()
+        source = (ROOT / 'scripts' / 'ensure_aws_cli.ps1').read_text()
         body = source[source.index('\ntry {\n'):]
         with tempfile.TemporaryDirectory(prefix='sync-agent-offline-') as folder:
             marker = Path(folder) / 'msi-invoked'
@@ -63,7 +63,7 @@ function Get-AuthenticodeSignature {{ param($LiteralPath)
 }}
 function Start-Process {{ param($FilePath, $ArgumentList, [switch]$PassThru)
     Set-Content -LiteralPath '{escaped}' -Value 'mock only'
-    $p = [pscustomobject]@{{ ExitCode={code} }}
+    $p = [pscustomobject]@{{ ExitCode={code}; Handle=1 }}
     $p | Add-Member -MemberType ScriptMethod -Name WaitForExit -Value {{ param($Timeout) return $true }}
     return $p
 }}
@@ -102,21 +102,21 @@ function Start-Process {{ param($FilePath, $ArgumentList, [switch]$PassThru)
 
 class DistributionContractTests(unittest.TestCase):
     def test_bootstrap_requires_verified_official_msi(self):
-        script = (ROOT / 'ensure_aws_cli.ps1').read_text()
+        script = (ROOT / 'scripts' / 'ensure_aws_cli.ps1').read_text()
         for required in ['https://awscli.amazonaws.com/AWSCLIV2-User.msi', 'Get-AuthenticodeSignature', "'Valid'", 'Amazon', '3010', '1641', '--version', 'finally', '-MaximumRedirection 0']:
             self.assertIn(required, script)
         for forbidden in ['Invoke-Expression', 'RunAs', 'AWSCLIV2.msi']:
             self.assertNotIn(forbidden, script)
 
     def test_install_stages_and_rolls_back_without_admin_or_process_killing(self):
-        script = (ROOT / 'install.ps1').read_text()
+        script = (ROOT / 'scripts' / 'install.ps1').read_text()
         for required in ['Programs\\SyncAgent', 'SyncAgent.exe', '--stop', 'staging', 'backup', 'catch', 'HKCU:', '--background', '--status', 'Read-Host']:
             self.assertIn(required, script)
         for forbidden in ['Stop-Process', 'taskkill', 'HKLM:', 'RunAs']:
             self.assertNotIn(forbidden, script)
 
     def test_uninstall_preserves_data_and_credentials(self):
-        script = (ROOT / 'uninstall.ps1').read_text()
+        script = (ROOT / 'scripts' / 'uninstall.ps1').read_text()
         self.assertIn('Read-Host', script)
         self.assertIn('--stop', script)
         self.assertIn('cancelled', script)
@@ -130,8 +130,6 @@ class DistributionContractTests(unittest.TestCase):
         for required in ['-m venv', 'requirements.txt', 'main.py', 'SyncAgent', 'ensure_aws_cli.ps1', 'install.ps1', 'uninstall.ps1', 'errorlevel']:
             self.assertIn(required, script)
         self.assertNotIn('hte_sync.py', script)
-        self.assertNotIn('pip install', (ROOT / 'program.bat').read_text())
-        self.assertIn('-r requirements.txt', (ROOT / 'requirments.txt').read_text())
 
 
 if __name__ == '__main__':

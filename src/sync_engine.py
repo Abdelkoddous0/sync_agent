@@ -91,6 +91,7 @@ class SyncEngine:
         self._due = None
         self._immediate_pending = False
         self._worker = None
+        self._hashes = {}
         self.last_report = {'conflicts':[], 'errors':[], 'changed':[]}
 
     def _path(self, name, create=False):
@@ -133,6 +134,31 @@ class SyncEngine:
         except FileNotFoundError:
             return None
 
+    # Files modified this recently are always re-hashed: a second write within the
+    # filesystem timestamp granularity can keep size and mtime unchanged.
+    RACY_SECONDS = 3
+
+    def _scan_fingerprint(self, name, seen):
+        """Scan-time hash reusing the previous digest while size/mtime/file ID are unchanged.
+
+        Transfer guards still call _fingerprint() and hash the full content.
+        """
+        try:
+            info = self._path(name).stat()
+        except FileNotFoundError:
+            return None
+        key = (info.st_size, info.st_mtime_ns, info.st_ino)
+        seen.add(name)
+        cached = self._hashes.get(name)
+        if cached and cached[0] == key:
+            return cached[1]
+        digest = self._fingerprint(name)
+        if digest is not None and time.time_ns() - info.st_mtime_ns > self.RACY_SECONDS * 10**9:
+            self._hashes[name] = (key, digest)
+        else:
+            self._hashes.pop(name, None)
+        return digest
+
     def _included(self, name):
         return ((self.cfg.get('recursive', True) or '/' not in name)
                 and not any(fnmatch.fnmatchcase(name, p) or fnmatch.fnmatchcase(Path(name).name, p)
@@ -144,6 +170,7 @@ class SyncEngine:
             raise ValueError('Local root missing; refusing to interpret as deletion')
         self._path('_probe_')
         result = {}
+        seen = set()
         def fail_scan(error):
             raise error
         for base, dirs, files in os.walk(self.root, followlinks=False, onerror=fail_scan):
@@ -156,7 +183,9 @@ class SyncEngine:
             for file in files:
                 name = (Path(base)/file).relative_to(self.root).as_posix()
                 if self._included(name):
-                    result[name] = self._fingerprint(name)
+                    result[name] = self._scan_fingerprint(name, seen)
+        for name in set(self._hashes) - seen:
+            del self._hashes[name]
         return result
 
     def _download(self, name, remote, local):

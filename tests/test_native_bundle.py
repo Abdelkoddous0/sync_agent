@@ -28,8 +28,18 @@ def test_native_frozen_install_upgrade_uninstall_preserves_data(tmp_path):
         except FileNotFoundError:
             return None
     assert startup() is None, 'Refusing native acceptance with an existing SyncAgent startup entry'
+    uninstall_key=r'Software\Microsoft\Windows\CurrentVersion\Uninstall\SyncAgent'
+    def installed_apps_entry():
+        try:
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER,uninstall_key) as key:
+                return winreg.QueryValueEx(key,'UninstallString')[0]
+        except FileNotFoundError:
+            return None
+    assert installed_apps_entry() is None, 'Refusing native acceptance with an existing Installed apps entry'
     root=tmp_path/'Local AppData 測試'; root.mkdir()
-    env=dict(os.environ,LOCALAPPDATA=str(root),AWS_EC2_METADATA_DISABLED='true')
+    roaming=tmp_path/'Roaming'; roaming.mkdir()
+    shortcut=roaming/'Microsoft'/'Windows'/'Start Menu'/'Programs'/'Sync Agent.lnk'
+    env=dict(os.environ,LOCALAPPDATA=str(root),APPDATA=str(roaming),AWS_EC2_METADATA_DISABLED='true')
     app=root/'Programs'/'SyncAgent'
     expected='"'+str(app/'SyncAgent.exe')+'" --background'
     def run(args,code=0):
@@ -48,6 +58,8 @@ def test_native_frozen_install_upgrade_uninstall_preserves_data(tmp_path):
         install()
         assert json.loads((app/'SyncAgent.install.json').read_text(encoding='utf-8-sig'))=={'product':'SyncAgent','schema':1}
         assert startup()==expected
+        assert shortcut.is_file()
+        assert str(app/'SyncAgent.exe') in installed_apps_entry()
         run([app/'SyncAgent.exe','--status'])
         local=tmp_path/'Synced files'; local.mkdir()
         (local/'valuable.txt').write_text('preserve local file',encoding='utf-8')
@@ -67,6 +79,7 @@ def test_native_frozen_install_upgrade_uninstall_preserves_data(tmp_path):
         run([powershell,'-NoProfile','-NonInteractive','-ExecutionPolicy','Bypass','-File',uninstall,'-Yes'])
         assert not app.exists()
         assert startup() is None
+        assert not shortcut.exists() and installed_apps_entry() is None
         assert configfile.read_bytes()==config_before
         assert baseline.read_text(encoding='utf-8')=='preserve baseline'
         assert (local/'valuable.txt').read_text(encoding='utf-8')=='preserve local file'
@@ -75,6 +88,8 @@ def test_native_frozen_install_upgrade_uninstall_preserves_data(tmp_path):
         if startup()==expected:
             with winreg.OpenKey(winreg.HKEY_CURRENT_USER,runkey,0,winreg.KEY_SET_VALUE) as key:
                 winreg.DeleteValue(key,'SyncAgent')
+        if str(app) in (installed_apps_entry() or ''):
+            winreg.DeleteKey(winreg.HKEY_CURRENT_USER,uninstall_key)
 
 
 def test_native_windows_junction_is_rejected(tmp_path):

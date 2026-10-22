@@ -44,8 +44,24 @@ function Assert-PlainTree([string]$Path) {
 }
 function Invoke-Agent([string]$Exe, [string]$Argument) {
     $process = Start-Process -FilePath $Exe -ArgumentList $Argument -PassThru -NoNewWindow
+    # Windows PowerShell 5.1 reports a $null ExitCode unless the handle is opened before exit.
+    $null = $process.Handle
     if (-not $process.WaitForExit(45000)) { throw "Sync Agent $Argument timed out; installation aborted without force-killing processes." }
     if ($process.ExitCode -ne 0) { throw "Sync Agent $Argument failed ($($process.ExitCode))." }
+}
+
+function Get-StartupValue([string]$Key) {
+    # Windows PowerShell 5.1 throws for a missing value even with -ErrorAction SilentlyContinue.
+    try { return Get-ItemPropertyValue -LiteralPath $Key -Name 'SyncAgent' -ErrorAction Stop }
+    catch [System.Management.Automation.PSArgumentException], [System.Management.Automation.ItemNotFoundException] { return $null }
+}
+
+function Move-Directory([string]$From, [string]$To) {
+    # A just-stopped agent can hold its EXE/DLL images open for a moment after releasing its lock.
+    for ($attempt = 1; ; $attempt++) {
+        try { Move-Item -LiteralPath $From -Destination $To; return }
+        catch { if ($attempt -ge 20) { throw }; Start-Sleep -Milliseconds 500 }
+    }
 }
 
 try {
@@ -55,7 +71,7 @@ try {
     Assert-NoSyncOverlap $app $data
     if (-not $SourceDir) {
         if (Test-Path -LiteralPath (Join-Path $PSScriptRoot 'SyncAgent.exe')) { $SourceDir = $PSScriptRoot }
-        else { $SourceDir = Join-Path $PSScriptRoot 'dist\SyncAgent' }
+        else { $SourceDir = Join-Path $PSScriptRoot '..\dist\SyncAgent' }  # scripts\ in a source checkout
     }
     $source = [IO.Path]::GetFullPath($SourceDir).TrimEnd('\')
     Assert-PlainTree $source
@@ -84,7 +100,7 @@ try {
     $staging = Join-Path $parent ('SyncAgent-staging-' + [guid]::NewGuid().ToString('N'))
     $backup = Join-Path $parent ('SyncAgent-backup-' + [guid]::NewGuid().ToString('N'))
     $runKey = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run'
-    $oldRun = Get-ItemPropertyValue -LiteralPath $runKey -Name 'SyncAgent' -ErrorAction SilentlyContinue
+    $oldRun = (Get-StartupValue $runKey)
     $movedOld = $false
     $movedNew = $false
     $registryChanged = $false
@@ -96,15 +112,15 @@ try {
         # Check staged application before disturbing the previous installation.
         Invoke-Agent (Join-Path $staging 'SyncAgent.exe') '--status'
         if (Test-Path -LiteralPath (Join-Path $app 'SyncAgent.exe')) { Invoke-Agent (Join-Path $app 'SyncAgent.exe') '--stop' }
-        if (Test-Path -LiteralPath $app) { Move-Item -LiteralPath $app -Destination $backup; $movedOld = $true }
-        Move-Item -LiteralPath $staging -Destination $app
+        if (Test-Path -LiteralPath $app) { Move-Directory $app $backup; $movedOld = $true }
+        Move-Directory $staging $app
         $movedNew = $true
         Invoke-Agent (Join-Path $app 'SyncAgent.exe') '--status'
         New-Item -Path $runKey -Force | Out-Null
         $registryChanged = $true
         if ($NoStartup) { Remove-ItemProperty -LiteralPath $runKey -Name 'SyncAgent' -ErrorAction SilentlyContinue }
         else { Set-ItemProperty -LiteralPath $runKey -Name 'SyncAgent' -Value ('"' + (Join-Path $app 'SyncAgent.exe') + '" --background') }
-        $actual = Get-ItemPropertyValue -LiteralPath $runKey -Name 'SyncAgent' -ErrorAction SilentlyContinue
+        $actual = (Get-StartupValue $runKey)
         if (-not $NoStartup -and $actual -ne ('"' + (Join-Path $app 'SyncAgent.exe') + '" --background')) { throw 'Startup registration read-back failed.' }
         if ($NoStartup -and $actual) { throw 'Startup removal read-back failed.' }
     } catch {
@@ -133,7 +149,10 @@ try {
         try { Remove-Item -LiteralPath $backup -Recurse -Force }
         catch { Write-Warning "Installed successfully, but old bundle remains at $backup : $_" }
     }
+    # Convenience only: a shortcut/Installed-apps failure must not undo a working installation.
+    try { Invoke-Agent (Join-Path $app 'SyncAgent.exe') '--register-shell' }
+    catch { Write-Warning "Start Menu shortcut or Installed apps entry could not be created: $_" }
     Write-Host "Installed Sync Agent in $app. User data remains at $data."
-    Write-Host ('Run "' + (Join-Path $app 'SyncAgent.exe') + '" --setup to configure; installation does not contact AWS.')
+    Write-Host ('Open "Sync Agent" from the Start Menu, or run "' + (Join-Path $app 'SyncAgent.exe') + '" --setup, to configure; installation does not contact AWS.')
     exit 0
 } catch { Write-Error $_; exit 1 }

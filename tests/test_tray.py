@@ -16,7 +16,7 @@ class TrayTests(unittest.TestCase):
         event = Mock()
         with patch.object(tray,'confirm_action',return_value=True), patch('subprocess.Popen') as launch:
             tray.launch_maintenance('--reconfigure',event)
-        self.assertEqual(launch.call_args.args[0],config.launch_command('--reconfigure'))
+        self.assertEqual(launch.call_args.args[0],config.launch_command('--reconfigure','--pause'))
         event.set.assert_not_called()
 
 if __name__ == '__main__': unittest.main()
