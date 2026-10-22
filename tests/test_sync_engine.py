@@ -196,3 +196,23 @@ def test_sdk_store_uses_conditional_operations_and_bounded_config(tmp_path):
     out=io.BytesIO(); store.download('a',out,'"new"',threading.Event())
     assert client.get['IfMatch']=='"new"' and out.getvalue()==b'hello'
     store.delete('a','"new"'); assert client.deleted['IfMatch']=='"new"'
+
+def test_repeated_failure_is_logged_once_then_as_a_reminder(tmp_path, monkeypatch, caplog):
+    import logging
+    import sync_engine
+    class FailingStore(FakeStore):
+        def list(self):
+            raise ConnectionError('injected')
+    engine = make_engine(tmp_path, FailingStore())
+    clock = [1000.0]
+    monkeypatch.setattr(sync_engine.time, 'monotonic', lambda: clock[0])
+    with caplog.at_level(logging.INFO):
+        for _ in range(50):
+            engine.sync()
+        assert [r.getMessage() for r in caplog.records] == ['ConnectionError']
+        clock[0] += sync_engine.REPEAT_LOG_SECONDS
+        engine.sync()
+        assert caplog.records[-1].getMessage() == 'Still failing: ConnectionError'
+        engine.store = FakeStore()
+        engine.sync()
+        assert caplog.records[-1].getMessage() == 'Previous sync problems resolved'

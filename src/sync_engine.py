@@ -24,6 +24,8 @@ import unicodedata
 
 from aws_errors import describe as describe_error
 
+REPEAT_LOG_SECONDS = 600
+
 
 def atomic_json(path, data):
     path = Path(path)
@@ -95,6 +97,21 @@ class SyncEngine:
         self._worker = None
         self._hashes = {}
         self.last_report = {'conflicts':[], 'errors':[], 'changed':[]}
+        self._logged_issues = ()
+        self._logged_at = 0.0
+
+    def _log_issues(self, issues):
+        # A persistent failure (bad clock, revoked key) repeats every poll: log it once, then a reminder.
+        issues = tuple(issues)
+        now = time.monotonic()
+        if issues and issues == self._logged_issues and now - self._logged_at < REPEAT_LOG_SECONDS:
+            return
+        if not issues and self._logged_issues:
+            logging.info('Previous sync problems resolved')
+        repeat = issues == self._logged_issues
+        for issue in issues:
+            logging.warning('%s%s', 'Still failing: ' if repeat else '', issue)
+        self._logged_issues, self._logged_at = issues, now
 
     def _path(self, name, create=False):
         if not safe_name(name):
@@ -309,8 +326,7 @@ class SyncEngine:
             except Exception as exc:
                 report['errors'].append(describe_error(exc))
             self.last_report = report
-            for issue in report['conflicts'] + report['errors']:
-                logging.warning('%s', issue)
+            self._log_issues(report['conflicts'] + report['errors'])
             return report
 
     def start(self):

@@ -9,6 +9,7 @@ All notable changes to Sync Agent. Dates are YYYY-MM-DD.
   - Windows PowerShell 5.1 reported an empty exit code for `Start-Process -PassThru`.
   - `Get-ItemPropertyValue` threw on a missing startup value even with `-ErrorAction SilentlyContinue`.
   - Console symbols crashed `SyncAgent.exe` when the installer captured its output.
+- A failure that repeats on every poll (wrong clock, deleted access key) filled the log with the same `WARNING ClientError` every few seconds. It is now logged once, then as "Still failing: …" every 10 minutes, followed by "Previous sync problems resolved" when it clears.
 - The tray's confirmation dialog appeared but could not be clicked; windows opened from the tray did not receive keyboard focus.
 - The setup window could disappear while waiting for input, and on Windows 11 the agent left a terminal window open. The agent now always starts without a window.
 - Downloads were limited to `transfer_timeout` in total, so large files failed on every pass; the limit now applies to stalls only.
