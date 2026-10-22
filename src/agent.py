@@ -33,6 +33,10 @@ def run_agent(cfg):
         log_handler.setFormatter(logging.Formatter('%(asctime)s %(levelname)s %(message)s'))
         logging.getLogger().addHandler(log_handler)
         logging.getLogger().setLevel(logging.INFO)
+        # boto3 logs "Found credentials in ..." on every client; only its warnings belong in the log.
+        logging.getLogger('botocore').setLevel(logging.WARNING)
+        logging.info('Sync Agent started: %s <-> s3://%s/%s (sign-in: %s)', cfg.get('local_path'), cfg.get('s3_bucket'),
+                     cfg.get('s3_prefix', ''), cfg.get('aws_profile') or cfg.get('auth_method'))
         from watchdog.observers import Observer
         from watchers import SyncHandler
         worker = sync_engine.SyncEngine(cfg)
@@ -92,6 +96,7 @@ def run_agent(cfg):
                 sync_engine.observer = None
                 guard.close()
                 if log_handler:
+                    logging.info('Sync Agent stopped')
                     logging.getLogger().removeHandler(log_handler)
                     log_handler.close()
 

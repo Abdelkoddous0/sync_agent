@@ -216,3 +216,17 @@ def test_repeated_failure_is_logged_once_then_as_a_reminder(tmp_path, monkeypatc
         engine.store = FakeStore()
         engine.sync()
         assert caplog.records[-1].getMessage() == 'Previous sync problems resolved'
+
+def test_log_records_every_file_action(tmp_path, caplog):
+    import logging
+    store = FakeStore({'remote.txt': b'from s3'})
+    engine = make_engine(tmp_path, store, delete_on_s3=True, delete_local=True)
+    (tmp_path / 'local' / 'mine.txt').write_bytes(b'from pc')
+    with caplog.at_level(logging.INFO):
+        engine.sync()
+        (tmp_path / 'local' / 'mine.txt').unlink()
+        del store.files['remote.txt']
+        engine.sync()
+    messages = [r.getMessage() for r in caplog.records]
+    assert messages == ['Uploaded mine.txt', 'Downloaded remote.txt', 'Connected to S3: 2 file(s) in sync',
+                        'Deleted from S3 (deleted locally): mine.txt', 'Deleted locally (deleted on S3): remote.txt']

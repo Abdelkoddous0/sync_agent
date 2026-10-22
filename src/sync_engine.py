@@ -98,6 +98,7 @@ class SyncEngine:
         self._hashes = {}
         self.last_report = {'conflicts':[], 'errors':[], 'changed':[]}
         self._logged_issues = ()
+        self._connected = False
         self._logged_at = 0.0
 
     def _log_issues(self, issues):
@@ -281,6 +282,7 @@ class SyncEngine:
                                 if r is not None and self.cfg.get('delete_on_s3',False):
                                     self.store.delete(name, r)
                                     r = None
+                                    logging.info('Deleted from S3 (deleted locally): %s', name)
                                 self.baseline[name] = {'local':None, 'remote':r}
                                 continue
                             if action == 'download' and not self.cfg.get('sync_from_s3',True):
@@ -291,6 +293,7 @@ class SyncEngine:
                                         raise ValueError('Local change before deletion')
                                     self._path(name).unlink()
                                     l = None
+                                    logging.info('Deleted locally (deleted on S3): %s', name)
                                 self.baseline[name] = {'local':l, 'remote':None}
                                 continue
                             # Retained deletion tombstone: never resurrect the absent side.
@@ -301,6 +304,7 @@ class SyncEngine:
                             if not self.cfg.get('sync_from_s3',True) or r is None:
                                 continue
                             l = self._download(name, r, l)
+                            logging.info('Downloaded %s', name)
                         elif l is not None:
                             if self._fingerprint(name) != l:
                                 raise ValueError('Local change before upload')
@@ -317,6 +321,7 @@ class SyncEngine:
                                     raise ValueError('Local change during snapshot')
                                 snapshot.seek(0)
                                 r = self.store.upload(name, snapshot, r)
+                            logging.info('Uploaded %s', name)
                         self.baseline[name] = {'local':l, 'remote':r}
                         report['changed'].append(name)
                     except Exception as exc:
@@ -326,6 +331,10 @@ class SyncEngine:
             except Exception as exc:
                 report['errors'].append(describe_error(exc))
             self.last_report = report
+            if not self._connected and not report['errors']:
+                self._connected = True
+                in_sync = sum(1 for entry in self.baseline.values() if entry['local'] is not None and entry['remote'] is not None)
+                logging.info('Connected to S3: %d file(s) in sync', in_sync)
             self._log_issues(report['conflicts'] + report['errors'])
             return report
 
