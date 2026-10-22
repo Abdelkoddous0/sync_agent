@@ -29,3 +29,6 @@ credentials
 *.pfx
 baseline-*.json
 *.log
+
+# Office lock files created while a document is open
+~$*
